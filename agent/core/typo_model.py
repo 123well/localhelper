@@ -266,21 +266,29 @@ class ProposalEngine:
         for s in siblings:
             if s.lower() == low:
                 continue
-            wd = weighted_distance(low, s.lower())
-            if wd <= max(2.0, len(low) * 0.55):
+            sl = s.lower()
+            wd = weighted_distance(low, sl)
+            # a sibling is only a plausible typo TARGET if the two names share
+            # most letters (jaccard >= 0.5). 'projects' vs 'Documents' has raw
+            # edit distance ~4 but zero finger-slip relation -> never propose.
+            jac = char_jaccard(low, sl)
+            if wd <= max(2.0, len(low) * 0.55) and jac >= 0.5:
                 # target_exists: verified live fact — the sibling is present on
                 # disk right now (checked again at judgement time below)
                 cands.append(Candidate(s, "path_segment", "filesystem",
                                        {"wdist": round(wd, 2),
                                         "rel": round(wd / max(1, len(low)), 3),
+                                        "jac": round(jac, 3),
                                         "target_exists": True}))
         for v, freq in lex.user_words.items():
             if v == low or v in siblings:
                 continue
             wd = weighted_distance(low, v)
-            if wd <= 2.0:
+            jac = char_jaccard(low, v)
+            if wd <= 2.0 and jac >= 0.5:
                 cands.append(Candidate(v, "path_segment", "learned_dict",
                                        {"wdist": round(wd, 2), "freq": freq,
+                                        "jac": round(jac, 3),
                                         "rel": round(wd / max(1, len(low)), 3)}))
         dec = layout_switch_rev(seg)
         if dec != seg and (dec.lower() in {s.lower() for s in siblings}
@@ -347,7 +355,15 @@ class MockModelAnalyzer(ModelTypoAnalyzer):
             seg, cands = res
             if self._declared_intentional(seg, lex):
                 continue                     # user said: intentional — never nag twice
-            v = self._judge(seg, cands, "path_segment", original=raw)
+            # Learned-dict candidates are WEAK evidence for paths: a brand-new
+            # legitimate name (~/projects vs known ~/Documents) merely looks
+            # similar. Only verified filesystem siblings / layout decodes can
+            # raise a path flag here.
+            strong = [c for c in cands
+                      if c.source == "filesystem" or c.source == "layout"]
+            if not strong:
+                continue
+            v = self._judge(seg, strong, "path_segment", original=raw)
             if v:
                 verdicts.append(v)
 

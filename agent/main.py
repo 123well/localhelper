@@ -59,11 +59,23 @@ class Agent:
 
     def _setup_logging(self) -> None:
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
-        logging.basicConfig(
-            level=getattr(logging, self.cfg.log_level.upper(), logging.INFO),
-            format="%(asctime)s %(name)s %(levelname)s %(message)s",
-            handlers=[logging.FileHandler(self.cfg.log_path),
-                      logging.StreamHandler()])
+        root = logging.getLogger()
+        root.setLevel(getattr(logging, self.cfg.log_level.upper(), logging.INFO))
+        # idempotent: tests may build many agents in one process; basicConfig
+        # would otherwise leak handlers and leave an unclosed log file fd
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:  # noqa: BLE001
+                pass
+        fmt = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        fh = logging.FileHandler(self.cfg.log_path)
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        root.addHandler(fh)
+        root.addHandler(sh)
 
     # ---------------- wiring ----------------
     def subscribe(self) -> None:
