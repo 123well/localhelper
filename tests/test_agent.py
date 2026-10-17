@@ -42,7 +42,23 @@ class TestTypoAnalyzer(unittest.TestCase):
 
     def test_real_command_not_flagged(self):
         self.assertEqual(self.an.analyze_line("git status", self.lex), [])
-        self.assertEqual(self.an.analyze_line("ls -la ~/projects", self.lex), [])
+
+    def test_ls_new_home_dir_not_flagged(self):
+        # 'ls -la ~/projects' on a machine WITHOUT ~/projects must not be
+        # flagged as a typo of some unrelated existing dir (fs-verified-only;
+        # regression for the projects->Documents false positive).  Uses the
+        # KDE_AGENT_HOME override so the result is deterministic.
+        from agent.core.typo_model import Lexicon, ProposalEngine, MockModelAnalyzer
+        from agent.core.initiative import KNOWN_CMDS
+        fake = Path(tempfile.mkdtemp(prefix="kde-agent-home-"))
+        (fake / "Documents").mkdir()
+        os.environ["KDE_AGENT_HOME"] = str(fake)
+        try:
+            lex = Lexicon(None)
+            an = MockModelAnalyzer(ProposalEngine(set(KNOWN_CMDS)))
+            self.assertEqual(an.analyze_line("ls -la ~/projects", lex), [])
+        finally:
+            os.environ.pop("KDE_AGENT_HOME", None)
 
     def test_path_typo_with_existing_sibling(self):
         home = Path.home()
@@ -239,6 +255,63 @@ class TestSleepTrainer(unittest.TestCase):
 def np_allclose(a, b):
     import numpy as np
     return bool(np.allclose(a, b))
+
+
+class TestKnowledgeCards(unittest.TestCase):
+    """CardStore regressions: reserved-word columns (keep/drop), dedup tiers,
+    conflict review flow ('program proposes — user decides')."""
+
+    def setUp(self):
+        self.tmp = _fresh_env()
+        from agent.memory.rag import Memory
+        from agent.knowledge.cards import CardStore
+        self.m = Memory(self.tmp / "mem.db", dim=128)
+        self.cs = CardStore(self.m)
+
+    def tearDown(self):
+        self.m.close()
+
+    def test_add_get_roundtrip(self):
+        c = self.cs.add("api", "systemd-run transient units",
+                        "systemd-run --user --unit=X cmd runs X in a transient unit.",
+                        examples=["systemd-run --user --unit=bak restic backup"],
+                        phrases=["transient unit"])
+        g = self.cs.get(c.id)
+        self.assertIsNotNone(g)
+        self.assertEqual(g.type, "api")
+        self.assertIn("bak", g.examples[0])
+
+    def test_near_duplicate_merges_bumps_version(self):
+        c1 = self.cs.add("concept", "git rebase interactive",
+                         "git rebase -i HEAD~3 lets you squash, edit and reorder commits.")
+        c2 = self.cs.add("concept", "git rebase interactive",
+                         "git rebase -i HEAD~3 lets you squash, edit and reorder commits.")
+        self.assertEqual(c1.id, c2.id)          # merged, not duplicated
+        self.assertGreaterEqual(c2.version, 2)
+
+    def test_conflict_recorded_and_resolved(self):
+        # regression for sqlite 'near "drop": syntax error' — keep/drop are
+        # reserved words and must be quoted in every statement.
+        base = ("journalctl -u myservice -b shows current-boot logs "
+                "for a systemd unit since boot")
+        self.cs.add("command", "journalctl basic usage", base)
+        c2 = self.cs.add("command", "journalctl boot logs",
+                         base.replace("for a systemd unit since boot",
+                                      "for the systemd unit since boot"))
+        pend = self.cs.pending_conflicts()
+        self.assertTrue(pend, "expected a pending conflict row")
+        dropped_id = pend[0][1]
+        self.cs.resolve_conflict(c2.id, dropped_id)   # human decides: keep new
+        self.assertEqual(self.cs.pending_conflicts(), [])
+        self.assertIsNone(self.cs.get(dropped_id))
+
+    def test_search_and_quality_report(self):
+        self.cs.add("command", "journalctl usage",
+                    "journalctl -u <service> -b shows current-boot logs for a unit.")
+        found = self.cs.search("journalctl service logs", top_k=3)
+        self.assertTrue(found)
+        rep = self.cs.quality_report()
+        self.assertIn("cards", rep)
 
 
 if __name__ == "__main__":
