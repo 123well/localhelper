@@ -46,18 +46,20 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
              numpy_helper.from_array(B_inp, "B_inp"),
              numpy_helper.from_array(C_out, "C_out")]
     nodes, value_info = [], []
-    cur = "input_ids"
+    # Embedding lookup happens ONCE outside the layer loop. input_ids is [1,1];
+    # Gather(Wemb, input_ids) yields [1,1,D], and Reshape([1,1,D] -> [D]) fails
+    # at runtime (needs D*D elements) — that per-layer reshape was the original
+    # bug. Flatten ids to [1] first: Gather -> [1,D] -> Reshape -> [D].
+    ids_1d = "ids_1d"
+    nodes.append(helper.make_node("Reshape", ["input_ids", "shape_1d_elem"],
+                                  [ids_1d]))
+    emb = "emb"
+    nodes.append(helper.make_node("Gather", ["Wemb", ids_1d], [emb], axis=0))
+    emb_f = "emb_float"
+    nodes.append(helper.make_node("Cast", [emb], [emb_f], to=TensorProto.FLOAT))
+    flat = "emb_flat"
+    nodes.append(helper.make_node("Reshape", [emb_f, "shape_1d"], [flat]))
     for i in range(layers):
-        emb = f"emb_{i}"
-        # ONNX Gather signature: Gather(data, indices) — data is the embedding
-        # matrix, indices are the token ids (reversed order fails graph check).
-        nodes.append(helper.make_node("Gather", ["Wemb", "input_ids"], [emb],
-                                      axis=0))
-        sq = f"emb_sq_{i}"
-        nodes.append(helper.make_node("Cast", [emb], [sq], to=TensorProto.FLOAT))
-        # emb is [1,1,D] (input_ids is [1,1]); flatten straight to [D].
-        flat = f"emb_flat_{i}"
-        nodes.append(helper.make_node("Reshape", [sq, "shape_1d"], [flat]))
         st = f"state_{i}"
         # state_in is [L, 1, D] (contract): Gather axis0 -> [1,D], squeeze -> [D].
         nodes.append(helper.make_node("Gather", ["state_in", f"idx_{i}"], [st],
@@ -90,8 +92,11 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     # logits = hid @ C_out (+ small position-dependent bias to prove 'pos' is live)
     posf = "pos_f"
     nodes.append(helper.make_node("Cast", ["pos"], [posf], to=TensorProto.FLOAT))
+    # pos arrives as [1,1] (contract); it holds exactly one element, so flatten
+    # with a [-1] shape (dynamic), NOT shape_1d (=D elements — that was the
+    # second Reshape crash: input {1,1} requested {64}).
     posr = "pos_r"
-    nodes.append(helper.make_node("Reshape", [posf, "shape_1d"], [posr]))
+    nodes.append(helper.make_node("Reshape", [posf, "shape_neg1"], [posr]))
     pb = "pos_bias"
     nodes.append(helper.make_node("Mul", [posr, "pos_scale"], [pb]))
     # broadcast (d,) -> (1, vocab): reshape via a (1, d) initializer, then
@@ -119,6 +124,8 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     # constants
     consts = {
         "shape_1d": np.array([d], dtype=np.int64),
+        "shape_1d_elem": np.array([1], dtype=np.int64),   # flatten [1,1] ids -> [1]
+        "shape_neg1": np.array([-1], dtype=np.int64),     # dynamic flatten (1 elem)
         "shape_1xd": np.array([1, d], dtype=np.int64),
         "axes_1": np.array([1], dtype=np.int64),
         # opset 17 Unsqueeze uses the LAST axis by default; to prepend a dim
