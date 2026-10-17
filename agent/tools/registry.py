@@ -229,7 +229,7 @@ class ToolRegistry:
     def due_reminders(self) -> list[tuple[int, str]]:
         """Reminders past their due time (called by the scheduler tick).
         Fixes the write-only dead collection: previously nothing ever read them."""
-        rows = self.memory.db.execute(
+        rows = self.memory._exec(
             "SELECT id,text,meta FROM items WHERE collection='reminders'").fetchall()
         now = time.time()
         out = []
@@ -243,9 +243,9 @@ class ToolRegistry:
         return out
 
     def acknowledge_reminder(self, reminder_id: int) -> None:
-        self.memory.db.execute("DELETE FROM items WHERE id=? AND collection='reminders'",
-                               (reminder_id,))
-        self.memory.db.commit()
+        self.memory._exec("DELETE FROM items WHERE id=? AND collection='reminders'",
+                          (reminder_id,))
+        self.memory._commit()
         self.memory._cache = None
 
     # ---------------- KDE plumbing --------------------------------------------

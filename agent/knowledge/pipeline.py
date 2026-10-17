@@ -118,24 +118,39 @@ class Source:
 
 
 class StudyQueue:
-    """sqlite-persisted so deferred work survives restarts."""
+    """sqlite-persisted so deferred work survives restarts.
+
+    check_same_thread=False + RLock: the daemon's idle study loop and the
+    control plane (`ctl study add <path>`) touch this DB from different
+    threads; serialize every statement through _exec/_commit."""
 
     def __init__(self, db_path: Path):
-        self.db = __import__("sqlite3").connect(str(db_path))
-        self.db.execute("""CREATE TABLE IF NOT EXISTS study_queue(
+        import sqlite3 as _sql
+        import threading
+        self.db = _sql.connect(str(db_path), check_same_thread=False)
+        self.lock = threading.RLock()
+        self._exec("""CREATE TABLE IF NOT EXISTS study_queue(
             path TEXT PRIMARY KEY, priority INTEGER, project TEXT,
             status TEXT DEFAULT 'queued', error TEXT DEFAULT '', ts REAL)""")
-        self.db.commit()
+        self._commit()
+
+    def _exec(self, sql, params=()):
+        with self.lock:
+            return self.db.execute(sql, params)
+
+    def _commit(self):
+        with self.lock:
+            self.db.commit()
 
     def enqueue(self, src: Source) -> None:
-        self.db.execute(
+        self._exec(
             "INSERT OR REPLACE INTO study_queue(path,priority,project,status,error,ts)"
             " VALUES(?,?,?,?,?,?)",
             (src.path, src.priority, src.project, src.status, src.error, time.time()))
-        self.db.commit()
+        self._commit()
 
     def next(self) -> Source | None:
-        row = self.db.execute(
+        row = self._exec(
             "SELECT path,priority,project FROM study_queue WHERE status='queued'"
             " ORDER BY priority ASC, ts ASC LIMIT 1").fetchone()
         if not row:
@@ -143,12 +158,12 @@ class StudyQueue:
         return Source(path=row[0], priority=row[1], project=row[2])
 
     def mark(self, path: str, status: str, error: str = "") -> None:
-        self.db.execute("UPDATE study_queue SET status=?,error=? WHERE path=?",
-                        (status, error, path))
-        self.db.commit()
+        self._exec("UPDATE study_queue SET status=?,error=? WHERE path=?",
+                   (status, error, path))
+        self._commit()
 
     def stats(self) -> dict:
-        rows = self.db.execute("SELECT status,COUNT(*) FROM study_queue GROUP BY status").fetchall()
+        rows = self._exec("SELECT status,COUNT(*) FROM study_queue GROUP BY status").fetchall()
         return dict(rows)
 
     def close(self) -> None:

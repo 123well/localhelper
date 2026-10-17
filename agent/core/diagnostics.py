@@ -168,12 +168,12 @@ def _check_all(ag, rep: DoctorReport) -> None:
 
     # ---- 6. vector DB + RAG roundtrip ---------------------------------------
     try:
-        before = ag.memory.db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        before = ag.memory._exec("SELECT COUNT(*) FROM items").fetchone()[0]
         rid = ag.memory.add("docs", "doctor-probe: векторная проверка alfa-bravo", "probe")
         hits = ag.memory.search("векторная проверка alfa", ("docs",), top_k=3)
         found = any(h.id == rid for h in hits)
-        ag.memory.db.execute("DELETE FROM items WHERE id=?", (rid,))
-        ag.memory.db.commit()
+        ag.memory._exec("DELETE FROM items WHERE id=?", (rid,))
+        ag.memory._commit()
         ag.memory._cache = None
         st = "ok" if found else "warn"
         rep.add("векторная БД: запись/поиск", st,

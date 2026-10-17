@@ -19,6 +19,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -77,24 +78,42 @@ class Hit:
 class Memory:
     def __init__(self, db_path: Path, dim: int = 256):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(db_path))
-        self.db.execute("""CREATE TABLE IF NOT EXISTS items(
+        # check_same_thread=False + RLock: diagnostics (`doctor`) and the
+        # control plane may touch the DB from a helper thread while the
+        # daemon loop is running; default threading mode would raise
+        # ProgrammingError and corrupt nothing only by luck. All access is
+        # serialized through `self.lock`.
+        self.db = sqlite3.connect(str(db_path), check_same_thread=False)
+        self.lock = threading.RLock()
+        self._exec("""CREATE TABLE IF NOT EXISTS items(
             id INTEGER PRIMARY KEY, collection TEXT, kind TEXT,
             text TEXT, meta TEXT, vec BLOB, value REAL DEFAULT 1.0,
             hits INTEGER DEFAULT 0, ts REAL)""")
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_coll ON items(collection)")
+        self._exec("CREATE INDEX IF NOT EXISTS idx_coll ON items(collection)")
         self.embedder = HashEmbedder(dim)
         self._cache: list[Hit] | None = None
+
+    # ---- thread-safe accessors ----------------------------------------
+    # All DB traffic goes through these so the daemon loop, the control
+    # plane and diagnostics helper-threads never interleave on one sqlite
+    # connection (check_same_thread=False alone is not safe).
+    def _exec(self, sql, params=()):
+        with self.lock:
+            return self.db.execute(sql, params)
+
+    def _commit(self):
+        with self.lock:
+            self.db.commit()
 
     # ---- write ---------------------------------------------------------
     def add(self, collection: str, text: str, kind: str = "",
             meta: dict | None = None, value: float = 1.0) -> int:
-        cur = self.db.execute(
+        cur = self._exec(
             "INSERT INTO items(collection,kind,text,meta,vec,value,ts) VALUES(?,?,?,?,?,?,?)",
             (collection, kind, text, json.dumps(meta or {}, ensure_ascii=False),
              _blob(self.embedder.embed(text)), value, time.time()))
         self._cache = None
-        self.db.commit()
+        self._commit()
         return cur.lastrowid
 
     def episode(self, kind: str, text: str, meta: dict | None = None,
@@ -107,7 +126,7 @@ class Memory:
     # ---- read -----------------------------------------------------------
     def _all(self) -> list[Hit]:
         if self._cache is None:
-            rows = self.db.execute(
+            rows = self._exec(
                 "SELECT id,collection,text,meta,vec,value,hits FROM items").fetchall()
             self._cache = [Hit(r[0], r[1], r[2], json.loads(r[3]), 0.0, r[5]) for r in rows]
             self._vecs = np.stack([_vec(r[4]) for r in rows]) if rows else np.zeros((0, self.embedder.dim), np.float32)
@@ -130,34 +149,34 @@ class Memory:
                 out.append(h)
                 if len(out) >= top_k:
                     break
-        self.db.executemany("UPDATE items SET hits=hits+1 WHERE id=?",
-                            [(h.id,) for h in out])
-        self.db.commit()
+        self._exec("UPDATE items SET hits=hits+1 WHERE id=?",
+                   [(h.id,) for h in out])
+        self._commit()
         return out
 
     def recent_episodes(self, limit: int = 30) -> list[Hit]:
-        rows = self.db.execute(
+        rows = self._exec(
             "SELECT id,meta,text,value FROM episodes_view ORDER BY ts DESC LIMIT ?",
-            (limit,)).fetchall() if False else self.db.execute(
+            (limit,)).fetchall() if False else self._exec(
             "SELECT id,meta,text,value,ts FROM items WHERE collection='episodes' "
             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         return [Hit(r[0], "episodes", r[2], json.loads(r[1]), 1.0, r[3]) for r in rows]
 
     # ---- maintenance (nightly consolidation) ----------------------------
     def reinforce(self, hit_id: int, delta: float = 0.2) -> None:
-        self.db.execute("UPDATE items SET value=value+? WHERE id=?", (delta, hit_id))
-        self.db.commit()
+        self._exec("UPDATE items SET value=value+? WHERE id=?", (delta, hit_id))
+        self._commit()
         self._cache = None
 
     def decay_and_prune(self, floor: float = 0.05) -> int:
         """Ebbinghaus-style forgetting: unused/noisy items sink below floor."""
         now = time.time()
-        self.db.execute(
+        self._exec(
             "UPDATE items SET value = value * EXP(-(? - ts)/7776000.0) WHERE collection!='prefs'",
             (now,))
-        cur = self.db.execute("DELETE FROM items WHERE value < ? AND collection='episodes'",
+        cur = self._exec("DELETE FROM items WHERE value < ? AND collection='episodes'",
                               (floor,))
-        self.db.commit()
+        self._commit()
         self._cache = None
         return cur.rowcount
 
@@ -165,7 +184,7 @@ class Memory:
         """Episodes of the last day. High-value items (errors, initiative
         outcomes) stay eligible for consolidation for 3 days — a single session
         may not fill the buffer."""
-        rows = self.db.execute(
+        rows = self._exec(
             "SELECT id,kind,text,meta,value FROM items WHERE collection='episodes' "
             "AND (ts > ? OR value >= 1.2) ORDER BY ts", (time.time() - 86400,)).fetchall()
         return [{"id": r[0], "kind": r[1], "text": r[2],
