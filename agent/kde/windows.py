@@ -224,7 +224,10 @@ class KWinWatcher:
             return
         try:
             import dbus_next
-            bus = await MessageBus(bus_type=dbus_next.BusType.SESSION).connect()
+            # REUSE the bridge's already-connected MessageBus. Creating a
+            # second asyncio MessageBus on the same loop deadlocked the whole
+            # daemon (control socket never became reachable — reproduced).
+            bus = self.bridge.bus
             intro = await bus.introspect("org.kde.KWin", "/KWin")
             obj = bus.get_object("org.kde.KWin", "/KWin")
             iface = obj.get_interface("org.kde.KWin")
