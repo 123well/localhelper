@@ -8,6 +8,9 @@ by the training repo's exporter in production):
              pos        int64 [1, 1]     -- absolute position of this token
     outputs: logits     float32 [1, V]
              state_out  float32 [N_S, 1, D]
+             next_token int64  [1, 1]    -- OPTIONAL; argmax(logits), computed
+                 inside the graph so a fully-fused XDNA/NPU subgraph never
+                 round-trips through the host between steps.
 
 The recurrent state is carried on-device between calls; a new conversation
 resets it via reset_state(). This is exactly what the Ryzen AI NPU (XDNA EP)
@@ -78,14 +81,19 @@ class OnnxSsmBackend:
             f"expected static state dims [L,1,D], got {shp}"
         n_layer, d_model = shp[0], shp[-1]
         self._zero_state = np.zeros((n_layer, 1, d_model), dtype=np.float32)
+        # optional in-graph greedy step (fused NPU subgraph emits it; older
+        # graphs may not — then we argmax on the host instead)
+        self.has_next_token = "next_token" in outs
         self.vocab_size = self.tokenizer.get_vocab_size()
         self.eos_id = self.tokenizer.token_to_id("</s>")
         if self.eos_id is None:
             self.eos_id = 0
         self.state = self._zero_state.copy()
         self.pos = 0
-        log.info("ONNX session ready on %s (layers=%d d_model=%d vocab=%d)",
-                 ",".join(self.providers), n_layer, d_model, self.vocab_size)
+        log.info("ONNX session ready on %s (layers=%d d_model=%d vocab=%d "
+                 "in-graph-greedy=%s)",
+                 ",".join(self.providers), n_layer, d_model, self.vocab_size,
+                 self.has_next_token)
 
     # ---- LLMBackend protocol -------------------------------------------------
     def reset_state(self) -> None:
@@ -101,14 +109,16 @@ class OnnxSsmBackend:
         self.reset_state()
         out_ids: list[int] = []
         limit = min(int(max_tokens), self.max_seq - len(ids))
-        for tok in ids:
-            logits, self.state = self._step(int(tok))
+        nxt = None
+        for tok in ids:                      # prefill: feed prompt tokens
+            _, nxt = self._step(int(tok))    # last step yields first sample
         for _ in range(max(1, limit)):
-            nxt = int(np.argmax(logits))
+            if nxt is None:                  # prefill skipped (shouldn't happen)
+                break
             if nxt == self.eos_id:
                 break
             out_ids.append(nxt)
-            logits, self.state = self._step(nxt)
+            _, nxt = self._step(nxt)
         return self._decode(out_ids)
 
     # ---- tokenization ---------------------------------------------------------
@@ -151,5 +161,11 @@ class OnnxSsmBackend:
             "pos": np.array([[self.pos]], dtype=np.int64),
         }
         self.pos += 1
-        res = self.sess.run(["logits", "state_out"], feeds)
-        return res[0], res[1]
+        if self.has_next_token:
+            lg, st, nt = self.sess.run(["logits", "state_out", "next_token"], feeds)
+            nxt = int(np.asarray(nt).reshape(-1)[0])
+        else:
+            lg, st = self.sess.run(["logits", "state_out"], feeds)
+            nxt = int(np.argmax(lg.reshape(lg.shape[-2] if lg.ndim > 2 else 1,
+                                           lg.shape[-1])[-1]))
+        return st, nxt
