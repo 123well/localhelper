@@ -101,6 +101,8 @@ CONTROL_HELP = {
     "history [N]":       "последние действия агента (эпизоды)",
     "config [путь]":     "показать конфигурацию (без секретов)",
     "tasks":             "активные фоновые задачи (idle-гейт, планировщик)",
+    "windows [list|probe|suggest <контекст>]": "оконный слой инициативы (снимки, профили)",
+    "scenario [list|show <имя>|remove <имя>]": "сохранённые сценарии-навыки",
 }
 
 
@@ -132,6 +134,8 @@ class ControlMixin:
         the event loop keeps serving user requests — the daemon must never
         freeze because a background job is draining its queue."""
         import asyncio as _aio
+        if name.lower().strip() == "windows":
+            return await self._ctl_windows(arg)
         if name.lower().strip() == "ask":
             q = (arg or "").strip()
             if not q:
@@ -272,6 +276,10 @@ class ControlMixin:
                         "learning_paused": getattr(self, "_bg_learning_paused", False),
                         "pending_interventions": len(self.initiative.pending),
                         "study_queue": self.study.queue.stats() if self.study else {}}
+            if name == "windows":
+                return {"ok": False, "error": "async-only: используйте ctl windows через сокет демона"}
+            if name == "scenario":
+                return self._ctl_scenario(arg)
             if name == "help":
                 return {"ok": True, "commands": CONTROL_HELP}
             return {"ok": False, "error": f"неизвестная команда '{name}'", "commands": list(CONTROL_HELP)}
@@ -280,6 +288,39 @@ class ControlMixin:
             return {"ok": False, "error": str(e)}
 
     # ---- sub-handlers -----------------------------------------------------
+    async def _ctl_windows(self, arg: str) -> dict:
+        """ctl windows [list|probe|suggest <контекст>]"""
+        parts = arg.split(maxsplit=1)
+        op = parts[0] if parts else "list"
+        if op == "probe":
+            ch = await self.winprober.probe(force=True)
+            return {"ok": True, "changes": len(ch),
+                    "windows": len(self.winstate.windows)}
+        if op == "suggest" and len(parts) > 1:
+            return {"ok": True, "apps": self.winstate.suggest_for_context(parts[1]),
+                    "note": "выученные спутники контекста; открытие — только через подтверждение"}
+        if not self.winstate.windows and self.winprober.available():
+            await self.winprober.probe(force=True)
+        return {"ok": True, "available": self.winprober.available(),
+                "windows": [{"wid": w.wid, "class": w.cls, "title": w.title[:60],
+                             "active": w.active}
+                            for w in self.winstate.windows.values()]}
+
+    def _ctl_scenario(self, arg: str) -> dict:
+        parts = arg.split(maxsplit=1)
+        op = parts[0] if parts else "list"
+        if op == "list":
+            return {"ok": True, "scenarios": self.scenarios.list()}
+        if op == "remove" and len(parts) > 1:
+            ok = self.bridge.confirm(f"Удалить сценарий «{parts[1]}»?", dangerous=True)
+            if not ok:
+                return {"ok": False, "error": "отменено пользователем"}
+            return {"ok": self.scenarios.remove(parts[1])}
+        if op == "show" and len(parts) > 1:
+            sc = self.scenarios.get(parts[1])
+            return {"ok": bool(sc), "scenario": sc}
+        return {"ok": False, "error": "scenario list|show <имя>|remove <имя>"}
+
     def _ctl_status(self) -> dict:
         return {"ok": True, "running": self.running,
                 "mode": self.safety.mode,

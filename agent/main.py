@@ -80,6 +80,21 @@ class Agent(ControlMixin):
             # /undo must be able to roll back applied diffs (text restore)
             self.code.undo_sink = self.tools.register_edit_undo
         self.bus = EventBus()
+        # ---- window initiative layer (spec: окна/приложения/контексты) ----
+        from agent.kde.windows import WindowInitiative, WindowProber, WindowState
+        self.winstate = WindowState(self.cfg.data_dir)
+        self.winprober = WindowProber(self.bridge, self.winstate, self.bus)
+        self.wininitiative = WindowInitiative(self.cfg.initiative, self.winstate,
+                                              self.memory)
+        self.tools.winstate = self.winstate
+        self.tools.winprober = self.winprober
+        # ---- scenarios / saved skills --------------------------------------
+        from agent.core.scenarios import ScenarioRunner, ScenarioStore
+        self.scenarios = ScenarioStore(self.memory)
+        self.scenario_runner = ScenarioRunner(self.scenarios, self.tools,
+                                              self.bridge, self.safety, self.memory)
+        self.tools.scenarios = self.scenarios
+        self.tools.scenario_runner = self.scenario_runner
         if self.cards is not None:
             from agent.knowledge.pipeline import EnergyGate, StudyPipeline, StudyQueue
             queue = StudyQueue(self.cfg.data_dir / "study_queue.db")
@@ -148,6 +163,11 @@ class Agent(ControlMixin):
         self.bus.subscribe("user_command", self.on_user_command)
         self.bus.subscribe("idle", self.on_idle)
         self.bus.subscribe("action_cancelled", self.on_cancelled)
+        # window layer: KWin signals / probe results feed the initiative engine
+        from agent.kde.windows import KWinWatcher
+        self.bus.subscribe("window_changed", self.on_window_changed)
+        self.bus.subscribe("windows_updated", self.on_windows_updated)
+        self._win_watcher = KWinWatcher(self.bus, self.bridge)
         self.bus.subscribe("*", self.audit)
 
     async def run(self) -> None:
@@ -159,6 +179,8 @@ class Agent(ControlMixin):
             (ShellSocketSource(self.bus).run(), "shell-socket"),
             (IdleWatcher(self.bus, self.bridge,
                          self.cfg.initiative.idle_help_after_sec).run(), "idle"),
+            (self._win_watcher.run(), "kwin-watcher"),
+            (self.window_heartbeat(), "window-heartbeat"),
             (self.bus.run(), "event-bus"),
             (self.night_scheduler(), "night-scheduler")]
         if self.interactive:
@@ -259,9 +281,22 @@ class Agent(ControlMixin):
 
     async def think_loop(self, user_msg: str = "") -> str:
         final = ""
+        # scenario shortlist enters the model context exactly once per request:
+        # when a saved skill fits the ask, the SSM should propose run_scenario
+        sc_ctx = ""
+        store = getattr(self, "scenarios", None)
+        if store is not None and user_msg:
+            try:
+                cands = store.match(user_msg)
+                if cands:
+                    sc_ctx = "\nДоступные сценарии (run_scenario): " + "; ".join(
+                        f"«{c['name']}» — {c['description'][:60]} (шагов {c['steps']})"
+                        for c in cands)
+            except Exception:  # noqa: BLE001
+                sc_ctx = ""
         for step in range(self.MAX_STEPS):
             res = self.model.think(user_msg or final[:200] or "continue",
-                                   context=self.ctx.render())
+                                   context=self.ctx.render() + (sc_ctx if step == 0 else ""))
             self.ctx.add("assistant", res.thought or res.reply, score=1.5)
             if not res.actions:
                 final = res.reply
@@ -289,6 +324,9 @@ class Agent(ControlMixin):
         if ivs:
             self.initiative.present(ivs)
         self.ctx.add("event", f"terminal command observed: {cmd[:120]}", score=0.8)
+        # window layer piggybacks on real user activity (zero extra polling):
+        # a typed command is the cheapest possible "something happened" hint
+        await self.winprober.probe()
 
     async def on_idle(self, ev) -> None:
         # reminders first: they are "initiative with a timestamp" — due ones
@@ -300,6 +338,13 @@ class Agent(ControlMixin):
         ivs = self.initiative.on_idle(ev.payload.get("idle_sec", 0))
         if ivs:
             self.initiative.present(ivs)
+        # idle is also the natural moment to evaluate window hygiene once
+        if self.winprober.available():
+            try:
+                await self.winprober.probe(force=True)
+                await self._window_initiative_pass()
+            except Exception:  # noqa: BLE001
+                log.debug("idle window pass failed", exc_info=True)
         # never-idle policy: idle is the natural window for background study
         # (energy gate + budget inside still protect battery/load/user work)
         if self.study is not None and not getattr(self, "_bg_learning_paused", False):
@@ -313,6 +358,39 @@ class Agent(ControlMixin):
     async def on_cancelled(self, ev) -> None:
         self.initiative.habits.utility.setdefault("idle", -0.2)
         self.memory.episode("cancel", "user cancelled agent action", value=1.2)
+
+    # ---------------- window layer ---------------------------------------
+    async def on_window_changed(self, ev) -> None:
+        """KWin signal fired -> refresh snapshot (rate-limited inside prober),
+        then let detectors speak. Event-driven: no polling."""
+        await self.winprober.probe()
+        await self._window_initiative_pass()
+
+    async def on_windows_updated(self, ev) -> None:
+        await self._window_initiative_pass()
+
+    async def _window_initiative_pass(self) -> None:
+        if not getattr(self.cfg.initiative, "enabled", True):
+            return
+        active = next((w.title for w in self.winstate.windows.values() if w.active), "")
+        cands = self.wininitiative.detect(active_hint=active)
+        worth = [iv for iv in cands if self.initiative.habits.should_intervene(iv)]
+        if worth:
+            self.initiative.present(worth)
+            self.memory.episode("window_suggestion", worth[0].message,
+                                {"keys": worth[0].context.get("keys", "")})
+
+    async def window_heartbeat(self) -> None:
+        """Very slow safety-net refresh so last_focus bookkeeping stays sane
+        even when KWin emits no signals (Wayland). 5 minutes = negligible cost;
+        all real detection is still event-driven."""
+        while self.running:
+            await asyncio.sleep(300)
+            if self.winprober.available():
+                try:
+                    await self.winprober.probe(force=True)
+                except Exception:  # noqa: BLE001
+                    log.debug("window heartbeat probe failed", exc_info=True)
 
     async def audit(self, ev) -> None:
         log.debug("audit %s %s", ev.kind, ev.payload)
@@ -336,6 +414,26 @@ class Agent(ControlMixin):
         elif cmd == "missed":
             self.initiative.habits.penalize_missed(arg or "typo_cmd", {"note": line})
             print("пропущенная ошибка учтена (штраф)")
+        elif cmd in ("scenario", "scenarios"):
+            # /scenario list | run <имя> [json-параметры] | show <имя>
+            sub, rest = (arg.split(maxsplit=1) + [""])[:2] if arg else ("list", "")
+            if sub in ("list", ""):
+                print(await self.tools.call("list_scenarios", {}))
+            elif sub == "run":
+                name, _, pj = rest.partition(" ")
+                try:
+                    params = json.loads(pj) if pj else {}
+                except json.JSONDecodeError:
+                    print("параметры должны быть JSON: /scenario run имя {\"dir\":\"...\"}")
+                    return
+                print(await self.tools.call("run_scenario",
+                                           {"name": name, "params": params}))
+            elif sub == "show":
+                sc = self.scenarios.get(rest.strip())
+                print(json.dumps(sc, ensure_ascii=False, indent=1)[:3000] if sc
+                      else f"сценарий не найден: {rest}")
+            else:
+                print("используйте: /scenario [list|run <имя> [json]|show <имя>]")
         elif cmd == "sleep":
             rep(await self.control_async("sleep", arg))
         elif cmd == "study":
