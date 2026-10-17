@@ -73,11 +73,10 @@ class OnnxSsmBackend:
                 f"graph does not match SSM contract; missing inputs={missing}, "
                 f"outputs={outs}")
         self.state_name, self.out_state_name = "state_in", "state_out"
-        shp = ins["state_in"].shape  # e.g. ['batch', 'n_layer', 'd_model']
-        d_model = shp[-1]
-        n_layer = shp[1] if len(shp) >= 3 else 1
-        assert isinstance(d_model, int) and isinstance(n_layer, int), \
-            f"expected static state dims, got {shp}"
+        shp = ins["state_in"].shape  # contract: [n_layer, 1, d_model]
+        assert len(shp) == 3 and isinstance(shp[0], int) and isinstance(shp[-1], int), \
+            f"expected static state dims [L,1,D], got {shp}"
+        n_layer, d_model = shp[0], shp[-1]
         self._zero_state = np.zeros((n_layer, 1, d_model), dtype=np.float32)
         self.vocab_size = self.tokenizer.get_vocab_size()
         self.eos_id = self.tokenizer.token_to_id("</s>")
