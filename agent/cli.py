@@ -62,7 +62,9 @@ async def _serve_control(agent) -> None:
             line = await asyncio.wait_for(reader.readline(), timeout=5)
             if line:
                 req = json.loads(line.decode())
-                resp = agent.control(req.get("cmd", "status"), req.get("arg", ""))
+                # async front door: heavy ops (study) run in worker threads
+                resp = await agent.control_async(req.get("cmd", "status"),
+                                                 req.get("arg", ""))
                 writer.write((json.dumps(resp, ensure_ascii=False, default=str) + "\n").encode())
                 await writer.drain()
         except Exception:  # noqa: BLE001  malformed client input is not fatal

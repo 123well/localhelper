@@ -65,6 +65,10 @@ class CardStore:
         self.high = dedup_high
         self.low = dedup_low
         self.db = memory.db  # share the RAG connection (single writer process)
+        # Thread-safety contract: every multi-statement sequence here must be
+        # wrapped in `with self.mem.lock:` — a bare _exec is atomic, but
+        # read-modify-write flows (add/merge/conflict, remove+item delete)
+        # interleave with the daemon loop otherwise (study runs in a thread).
         self.mem._exec("""CREATE TABLE IF NOT EXISTS cards(
             id INTEGER PRIMARY KEY, version INTEGER DEFAULT 1, type TEXT,
             summary TEXT, body TEXT, examples TEXT, phrases TEXT, meta TEXT,
@@ -83,39 +87,42 @@ class CardStore:
         examples = list(examples or [])
         phrases = list(phrases or [])
         payload = self._payload(summary, body, phrases)
-        best_id, best_sim = self._nearest(payload)
+        with self.mem.lock:                    # whole RMW flow is atomic now
+            best_id, best_sim = self._nearest(payload)
 
-        if best_id is not None and best_sim >= self.high:
-            return self._merge(best_id, examples, phrases, value)
+            if best_id is not None and best_sim >= self.high:
+                return self._merge(best_id, examples, phrases, value)
 
-        if best_id is not None and self.low <= best_sim < self.high \
-                and _summary_key(summary) != _summary_key(self.get(best_id).summary):
-            other = self.get(best_id)
-            # newer source wins provisionally, old one flagged for review
+            conflict_flag = None
+            if best_id is not None and self.low <= best_sim < self.high \
+                    and _summary_key(summary) != _summary_key(self.get(best_id).summary):
+                other = self.get(best_id)
+                conflict_flag = other.id
+                # newer source wins provisionally, old one flagged for review
+                self.mem._exec(
+                    'INSERT INTO card_conflicts("keep","drop",note,ts) VALUES(?,?,?,?)',
+                    (None, other.id, f"similar {best_sim:.2f} to #{other.id}", time.time()))
+                self.mem._commit()
+
+            item_id = self.mem.add(COLLECTION, payload, type, meta, value=value)
+            now = time.time()
             cur = self.mem._exec(
-                'INSERT INTO card_conflicts("keep","drop",note,ts) VALUES(?,?,?,?)',
-                (None, other.id, f"similar {best_sim:.2f} to #{other.id}", time.time()))
+                "INSERT INTO cards(version,type,summary,body,examples,phrases,meta,"
+                "item_id,usages,helpful,not_helpful,created,updated)"
+                " VALUES(1,?,?,?,?,?,?,?,0,0,0,?,?)",
+                (type, summary, body, json.dumps(examples, ensure_ascii=False),
+                 json.dumps(phrases, ensure_ascii=False),
+                 json.dumps(meta or {}, ensure_ascii=False), item_id, now, now))
+            cid = cur.lastrowid
             self.mem._commit()
-
-        item_id = self.mem.add(COLLECTION, payload, type, meta, value=value)
-        now = time.time()
-        cur = self.mem._exec(
-            "INSERT INTO cards(version,type,summary,body,examples,phrases,meta,"
-            "item_id,usages,helpful,not_helpful,created,updated)"
-            " VALUES(1,?,?,?,?,?,?,?,0,0,0,?,?)",
-            (type, summary, body, json.dumps(examples, ensure_ascii=False),
-             json.dumps(phrases, ensure_ascii=False),
-             json.dumps(meta or {}, ensure_ascii=False), item_id, now, now))
-        cid = cur.lastrowid
-        self.mem._commit()
-        card = self.get(cid)
-        if card is not None and best_id is not None and self.low <= best_sim < self.high:
-            card.meta = dict(card.meta or {})
-            card.meta["conflict_with"] = best_id
-            self.mem._exec("UPDATE cards SET meta=? WHERE id=?",
-                            (json.dumps(card.meta, ensure_ascii=False), cid))
-            self.mem._commit()
-        return card
+            card = self.get(cid)
+            if card is not None and conflict_flag is not None:
+                card.meta = dict(card.meta or {})
+                card.meta["conflict_with"] = conflict_flag
+                self.mem._exec("UPDATE cards SET meta=? WHERE id=?",
+                                (json.dumps(card.meta, ensure_ascii=False), cid))
+                self.mem._commit()
+            return card
 
     def _merge(self, card_id: int, examples: list[str], phrases: list[str],
                value_delta: float) -> Card:
@@ -183,6 +190,18 @@ class CardStore:
         return self.get(row[0]) if row else None
 
     # ------------------------------------------------------------- usage stats
+    def update_meta(self, card_id: int, meta: dict) -> None:
+        """Persist metadata changes (self-check flags, restudy markers)."""
+        with self.mem.lock:
+            self.mem._exec("UPDATE cards SET meta=?, updated=? WHERE id=?",
+                           (json.dumps(meta, ensure_ascii=False), time.time(), card_id))
+            self.mem._commit()
+
+    def needs_restudy(self) -> list[Card]:
+        rows = self.mem._exec("SELECT id FROM cards WHERE meta LIKE '%needs_restudy%'")\
+                      .fetchall()
+        return [c for c in (self.get(r[0]) for r in rows) if c]
+
     def record_usage(self, card_id: int) -> None:
         self.mem._exec("UPDATE cards SET usages=usages+1 WHERE id=?", (card_id,))
         self.mem._commit()
@@ -218,15 +237,16 @@ class CardStore:
 
     # ------------------------------------------------------------------ delete
     def remove(self, card_id: int) -> None:
-        c = self.get(card_id)
-        if c is None:
-            return
-        self.mem._exec("DELETE FROM cards WHERE id=?", (card_id,))
-        self.mem._commit()
-        if c.item_id:
-            self.mem._exec("DELETE FROM items WHERE id=?", (c.item_id,))
+        with self.mem.lock:            # card row + its item vector die together
+            c = self.get(card_id)
+            if c is None:
+                return
+            self.mem._exec("DELETE FROM cards WHERE id=?", (card_id,))
             self.mem._commit()
-            self.mem.invalidate_cache()
+            if c.item_id:
+                self.mem._exec("DELETE FROM items WHERE id=?", (c.item_id,))
+                self.mem._commit()
+                self.mem.invalidate_cache()
 
     # ---------------------------------------------------------------- nightly
     def quality_report(self) -> dict:

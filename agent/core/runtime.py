@@ -125,6 +125,40 @@ class ControlMixin:
         await self.think_loop(user_msg=text)
 
     # ---- control plane ----------------------------------------------------
+    async def control_async(self, name: str, arg: str = "") -> dict:
+        """Async front door of the control plane (daemon socket server uses
+        this). Heavy blocking ops (study batches) run in a worker thread so
+        the event loop keeps serving user requests — the daemon must never
+        freeze because a background job is draining its queue."""
+        import asyncio as _aio
+        if name.lower().strip() == "study":
+            a = arg.strip()
+            if not a.startswith("add") and a not in ("stop", "queue"):
+                if self.study is not None:
+                    budget = float(a) if a.replace(".", "", 1).isdigit() else 20.0
+                    self._bg_learning_paused = False
+                    reps = await _aio.to_thread(self.study.run_pending, budget_sec=budget)
+                    return {"ok": True, "processed": len(reps),
+                            "queue": self.study.queue.stats()}
+        return self.control(name, arg)
+
+    def _study_kick(self, budget: float = 20.0) -> None:
+        """Fire-and-forget background batch (never blocks the caller)."""
+        if self.study is None or getattr(self, "_bg_learning_paused", False):
+            return
+        async def _run():
+            try:
+                reps = await asyncio.to_thread(self.study.run_pending, budget_sec=budget)
+                if reps:
+                    logging.getLogger("kde-agent.study").info(
+                        "kick batch: %d sources processed", len(reps))
+            except Exception:  # noqa: BLE001
+                logging.getLogger("kde-agent.study").exception("kick batch failed")
+        try:
+            asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            pass   # no loop (sync tests / ctl cold path): queue persists anyway
+
     def control(self, name: str, arg: str = "") -> dict:
         """Programmatic management API (CLI `ctl`, D-Bus, future settings UI)."""
         name = name.lower().strip()
@@ -184,6 +218,9 @@ class ControlMixin:
                         from agent.knowledge.pipeline import Source
                         self.study.queue.enqueue(Source(path=str(pp), priority=prio))
                         n = 1
+                    # never-idle policy: user explicitly asked to study this —
+                    # kick a short background batch instead of waiting for idle
+                    self._study_kick(20.0)
                     return {"ok": True, "queued": n, "path": str(pp)}
                 if a == "stop":
                     # принудительная остановка фонового обучения (spec)
