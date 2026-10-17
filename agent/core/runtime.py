@@ -278,7 +278,7 @@ class ControlMixin:
             self.memory._exec("UPDATE items SET vec=? WHERE id=?",
                               (vec.astype("float32").tobytes(), rid))
         self.memory._commit()
-        self.memory._cache = None
+        self.memory.invalidate_cache()
         return {"ok": True, "reindexed": len(rows)}
 
     def _kb_clear(self, coll: str) -> dict:
@@ -292,5 +292,5 @@ class ControlMixin:
                 self.memory._exec("DELETE FROM cards")
         cur = self.memory._exec(q, () if coll == "all" else (coll,))
         self.memory._commit()
-        self.memory._cache = None
+        self.memory.invalidate_cache()
         return {"ok": True, "deleted": cur.rowcount, "collection": n}
