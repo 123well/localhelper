@@ -171,14 +171,28 @@ class WindowState:
 
 
 def _project_keywords(title: str) -> list[str]:
-    """~/dev/proj — file.txt  ->  ['proj'] ; plain titles give nothing."""
-    m = re.search(r"(?:^|[\s/~-])([A-Za-z0-9_.-]{3,30})(?:[/~\s]|$)", title)
-    if not m:
-        return []
-    kw = m.group(1).lower()
-    stop = {"the", "and", "for", "with", "konsole", "dolphin", "firefox",
-            "plasma", "agent", "file", "txt", "pdf"}
-    return [] if kw in stop or kw.isdigit() else [kw]
+    """Extract project-ish tokens from a window title.
+
+    'main.py — myproj'      -> ['myproj']
+    '~/dev/myproj — main.py'-> ['dev', 'myproj']  ('dev' is generic but kept;
+                                                    suggest_for_context ranks
+                                                    by accumulated counts, so
+                                                    the specific kw wins)
+    Plain titles give nothing useful. Stoplist drops filenames (contain '.')
+    and common noise words.
+    """
+    kws = []
+    for tok in re.split(r"[\s/~—|:,.\-]+", title):   # em-dash is a separator
+        t = tok.lower().strip()
+        if not t or len(t) < 3 or len(t) > 30:
+            continue
+        if "." in t or t.isdigit():                  # file.ext / numbers
+            continue
+        if t in {"the", "and", "for", "with", "konsole", "dolphin", "firefox",
+                "plasma", "agent", "file", "txt", "pdf", "home"}:
+            continue
+        kws.append(t)
+    return kws
 
 
 # ---------------------------------------------------------------------------

@@ -141,8 +141,8 @@ class ScenarioRunner:
         if not sc:
             return {"ok": False, "error": f"сценарий не найден: {name_or_id}"}
         spec = sc["spec"]
-        p = {**(spec.get("params") and {k: "" for k in spec["params"]}),
-             **(params or {})}
+        p = {k: "" for k in (spec.get("params") or [])}
+        p.update(params or {})
         # precondition: simple key==value facts about current state
         pre = spec.get("precondition") or {}
         if pre.get("mode_not_safe") and self.safety.mode in ("safe", "read_only"):
