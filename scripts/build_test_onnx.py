@@ -11,8 +11,13 @@ emits a miniature model with the exact same I/O contract:
 
 The "model" is a deterministic hash-based policy: it learns nothing, but it
 reproduces the SYSTEM_PROMPT JSON contract for the demo intents (list/run/
-read), so OnnxSsmBackend can be exercised end-to-end on CPU here and on the
-XDNA NPU at home with zero code changes.
+read) via a deterministic hash-based policy, so OnnxSsmBackend can be
+exercised end-to-end on CPU here and on the XDNA NPU at home with zero code
+changes. The policy lives in C_out (row t = token id emitted after hashing
+the hidden state); edit _policy_matrix()/build_graph to change responses.
+NOTE: the backend feeds prompt tokens one-by-one WITHOUT attention, so only
+the LAST prefill token selects the output row — patterns must key on the
+tail of each intent ("files in ~/dev", "выполни rm -rf /", "файл config.py").
 
 Usage:
     python scripts/build_test_onnx.py --out-dir ~/.local/share/kde-agent/model \
@@ -31,6 +36,65 @@ from pathlib import Path
 import numpy as np
 
 
+def _policy_matrix(vocab: int, d: int):
+    """Deterministic emit-policy rows for the tiny graph's C_out.
+
+    Row j of C_out scores logits over the vocabulary; argmax picks the next
+    token. Default rows produce a benign filler word then EOS (so unknown
+    contexts terminate cleanly). Pattern rows override specific last-prefill-
+    token ids to emit the agent JSON-contract answers.
+    Returns (C_out, {last_char: (pattern_str, start_idx)} for diagnostics).
+    """
+    # rows are ONE-HOT on purpose: with random rows the argmax was dominated
+    # by a shared hidden-state direction (every token scored ~3e9), so no
+    # policy could ever win. One-hot + bias below keeps the tiny graph fully
+    # deterministic; real graphs replace this whole matrix with trained heads.
+    C = np.full((d, vocab), -1e-6, dtype=np.float32)
+    filler = "ok"
+    # default behaviour everywhere: 'o' -> 'k' -> </s>
+    def _ascii_only(s):
+        return "".join(c for c in s if 32 <= ord(c) < 127)
+
+    def set_row(row_id, seq):
+        seq = _ascii_only(seq)
+        c = np.zeros(d, dtype=np.float32)
+        c[0] = 1.0
+        C[:, row_id] = c
+        for k, ch in enumerate(seq):
+            if k < d - 1:
+                C[k, ord(ch)] = 1.0
+        C[min(len(seq), d - 1), 95] = 1.0   # </s> is id 95 (see build_tokenizer)
+    for r in range(vocab):
+        set_row(r, filler)
+    # (last prefill char, full emitted text) — text starts at index 0 of C rows
+    patterns = {
+        # keyed by the LAST prefill token (see NOTE in module docstring)
+        "v": ('{"thought":"user wants a directory listing","actions":'
+              '[{"tool":"list_files","args":{"path":"~/dev"}}],"reply":""}'),
+        "/": ('{"thought":"rm -rf is destructive; ask first","actions":'
+              '[{"tool":"confirm_dialog","args":{"question":"Delete '
+              'everything? Needs user confirmation."}}],"reply":""}'),
+        ")": ('{"thought":"file read","actions":[{"tool":"read_file",'
+              '"args":{"path":"config.py"}}],"reply":""}'),
+    }
+    diag = {}
+    for last_ch, text in patterns.items():
+        text = _ascii_only(text)
+        row = ord(last_ch)
+        c = np.zeros(d, dtype=np.float32)
+        c[0] = 1.0
+        C[:, row] = c
+        for k, ch in enumerate(text):
+            if k < d - 1:
+                C[k, ord(ch)] = 1.0
+        if len(text) >= d - 1:
+            print(f"WARN: pattern for {last_ch!r} ({len(text)} chars) truncated "
+                  f"at d={d}; raise --d to emit it fully")
+        C[min(len(text), d - 1), 95] = 1.0
+        diag[last_ch] = (text, row)
+    return C, diag
+
+
 def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     import onnx
     from onnx import helper, numpy_helper, TensorProto
@@ -39,7 +103,7 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     Wemb = rng.standard_normal((vocab, d)).astype(np.float32) * 0.1
     A_rec = rng.standard_normal((d, d)).astype(np.float32) * 0.05   # recurrent proj
     B_inp = rng.standard_normal((d, d)).astype(np.float32) * 0.5    # input injection
-    C_out = rng.standard_normal((d, vocab)).astype(np.float32) * 0.1
+    C_out, _policy_diag = _policy_matrix(vocab, d)
 
     inits = [numpy_helper.from_array(Wemb, "Wemb"),
              numpy_helper.from_array(A_rec, "A_rec"),
@@ -89,6 +153,11 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
                                           [f"so_{i}"]))
         else:
             final_hid = th
+    # logits = hid[1,D] @ C_out[D,V] -> [1,V] (contract). final_hid is 1-D [D],
+    # so it MUST be reshaped to [1,D] before the MatMul — feeding [D] made ORT
+    # emit [64,800]-style logits (shape-merge warning + contract violation).
+    fh2 = "final_hid_2d"
+    nodes.append(helper.make_node("Reshape", [final_hid, "shape_1xd"], [fh2]))
     # logits = hid @ C_out (+ small position-dependent bias to prove 'pos' is live)
     posf = "pos_f"
     nodes.append(helper.make_node("Cast", ["pos"], [posf], to=TensorProto.FLOAT))
@@ -109,10 +178,15 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     pbe = "pos_bias_e"
     nodes.append(helper.make_node("Expand", [pbt, "shape_logits"], [pbe]))
     lg0 = "logits_pre"
-    fh2 = "final_hid_2d"
-    nodes.append(helper.make_node("Reshape", [final_hid, "shape_1xd"], [fh2]))
     nodes.append(helper.make_node("MatMul", [fh2, "C_out"], [lg0]))
     nodes.append(helper.make_node("Add", [lg0, pbe], ["logits"]))
+    # In-graph greedy step: argmax(logits) -> next_token int64 [1,1]. The NPU
+    # subgraph then stays fully fused (no host round-trip between tokens);
+    # OnnxSsmBackend consumes it when present and falls back to host argmax
+    # for graphs built without it.
+    nt32 = "next_token_i32"
+    nodes.append(helper.make_node("ArgMax", ["logits"], [nt32], axis=1, keepdims=1))
+    nodes.append(helper.make_node("Cast", [nt32], ["next_token"], to=TensorProto.INT64))
     # last layer writes its hidden back into state slot L-1
     usl = "usl"
     nodes.append(helper.make_node("Reshape", [final_hid, "shape_1xd"], [usl]))
@@ -133,7 +207,7 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
         "axes_neg1": np.array([-1], dtype=np.int64),
         "axes_0": np.array([0], dtype=np.int64),
         "shape_logits": np.array([1, vocab], dtype=np.int64),
-        "pos_scale": np.full((d,), 1e-4, dtype=np.float32),
+        "pos_scale": np.full((d,), 1e-5, dtype=np.float32),  # stays «noise»
         "A_rec_T": A_rec.T.copy(),
         "B_inp_T": B_inp.T.copy(),
     }
@@ -154,6 +228,7 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     g_outputs = [
         helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, vocab]),
         helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [layers, 1, d]),
+        helper.make_tensor_value_info("next_token", TensorProto.INT64, [1, 1]),
     ]
     graph = helper.make_graph(nodes, "tiny_ssm", g_inputs, g_outputs, inits)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)],
