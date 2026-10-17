@@ -206,7 +206,25 @@ def _check_all(ag, rep: DoctorReport) -> None:
 
     # ---- 9. tools under current mode ----------------------------------------
     try:
-        out = asyncio.run(ag.tools.call("exec_command", {"command": "echo doctor-echo"}))
+        async def _tool_probe():
+            return await ag.tools.call("exec_command", {"command": "echo doctor-echo"})
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and running.is_running():
+            # ctl 'doctor' inside the daemon: run the probe on a private loop
+            import threading
+            box: dict = {}
+
+            def _t():
+                box["v"] = asyncio.run(_tool_probe())
+            th = threading.Thread(target=_t, daemon=True)
+            th.start()
+            th.join(timeout=15)
+            out = box.get("v", "BLOCKED: probe timed out")
+        else:
+            out = asyncio.run(_tool_probe())
         if "doctor-echo" in out:
             rep.add("инструменты: выполнение команд", "ok", "exec_command прошёл risk-gate")
         elif out.startswith("BLOCKED"):
@@ -230,9 +248,16 @@ def _check_all(ag, rep: DoctorReport) -> None:
 
     # ---- 11. confirmation system --------------------------------------------
     try:
-        c = ag.bridge.confirm("doctor: тестовая проверка системы подтверждений", timeout_sec=1)
-        rep.add("система подтверждений", "ok",
-                f"канал подтверждения отвечает ({'принято' if c else 'отклонено/таймаут'})")
+        import sys as _sys
+        if _sys.stdin is not None and _sys.stdin.isatty():
+            # interactive terminal: don't block the doctor waiting for a human
+            rep.add("система подтверждений", "warn",
+                    "stdin интерактивен — диалог пропущен, чтобы не блокировать "
+                    "диагностику (проверьте вручную через ctl или запуск)")
+        else:
+            c = ag.bridge.confirm("doctor: тестовая проверка системы подтверждений")
+            rep.add("система подтверждений", "ok",
+                    f"канал подтверждения отвечает ({'принято' if c else 'отклонено/таймаут'})")
     except Exception as e:  # noqa: BLE001
         rep.add("система подтверждений", "fail", str(e)[:120])
 
@@ -280,7 +305,44 @@ def _check_all(ag, rep: DoctorReport) -> None:
             bus.emit("test")
             await asyncio.sleep(0.05)
             return bus.queue.empty()
-        drained = asyncio.run(_drive())
+
+        async def _drive_with_consumer():
+            # EventBus.run() is the dispatcher: without it emit() only fills
+            # the queue and handlers never execute. Consume one event, let a
+            # failing handler run through the isolated try/except, then stop.
+            consumer = asyncio.create_task(bus.run())
+            try:
+                bus.emit("test")
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while not bus.queue.empty() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)  # let the handler finish/log
+            finally:
+                consumer.cancel()
+                try:
+                    await consumer
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            return bus.queue.empty()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            # Called from inside a running loop (ctl 'doctor' in the daemon):
+            # drive the check synchronously via a dedicated thread, since
+            # run_doctor itself is sync and asyncio.run() would nest loops.
+            import threading
+            box: dict = {}
+
+            def _threaded():
+                box["v"] = asyncio.run(_drive_with_consumer())
+            t = threading.Thread(target=_threaded, daemon=True)
+            t.start()
+            t.join(timeout=5)
+            drained = box.get("v", False)
+        else:
+            drained = asyncio.run(_drive_with_consumer())
         rep.add("обработка ошибок событий", "ok" if drained else "warn",
                 "падающий handler не убил шину (isolated try/except)")
     except Exception as e:  # noqa: BLE001

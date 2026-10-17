@@ -76,15 +76,37 @@ class KDEBridge:
                            check=False)
 
     # ---------- confirmation dialogs ---------------------------------------
-    def confirm(self, question: str, dangerous: bool = True) -> bool:
-        """Blocking yes/no. In headless/tests auto-approves safe ops only."""
+    def confirm(self, question: str, dangerous: bool = True,
+                timeout_sec: float | None = None) -> bool:
+        """Blocking yes/no. Headless (no display, no stdin tty) => deny by default.
+
+        Deny-by-default is required for the always-on daemon: a background
+        service has no terminal, and blocking on input() would freeze the
+        event loop forever. Non-interactive callers must pass an explicit
+        confirmation channel or run in interactive mode.
+        """
+        interactive_stdin = False
+        try:
+            interactive_stdin = __import__("sys").stdin.isatty()
+        except Exception:  # noqa: BLE001
+            interactive_stdin = False
         if shutil.which("kdialog") and _has_display():
             cmd = ["kdialog", "--title", "KDE Agent"]
             cmd += ["--warning" if dangerous else "--info"]
             cmd += ["--yesno", question]
-            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            return r.returncode == 0
-        ans = input(f"[AGENT CONFIRM] {question} [y/N]: ").strip().lower()
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   check=False, timeout=timeout_sec)
+                return r.returncode == 0
+            except subprocess.TimeoutExpired:
+                return False
+        if not interactive_stdin:
+            log.warning("confirm denied (non-interactive): %s", question[:80])
+            return False
+        try:
+            ans = input(f"[AGENT CONFIRM] {question} [y/N]: ").strip().lower()
+        except (EOFError, OSError):
+            return False
         return ans in ("y", "да", "yes")
 
     def ask(self, question: str) -> str:
