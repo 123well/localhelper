@@ -145,6 +145,18 @@ class AgentConfig:
     sleep: SleepConfig = field(default_factory=SleepConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
     log_level: str = "INFO"
+    # ---- runtime / control-plane settings (spec: future settings window) ----
+    # Output channels wired by default; voice_out / gui_chat are declared in
+    # the registry but stay inactive until the corresponding modules exist.
+    output_channels: list[str] = field(
+        default_factory=lambda: ["stdout", "log"])
+    # Directories the agent may study in background WITHOUT asking (privacy).
+    allowed_study_dirs: list[str] = field(default_factory=list)
+    # Diagnostics budget: daemon RSS above this is a doctor warning.
+    max_rss_mb: int = 1500
+    # Log rotation (bounded growth, spec requirement).
+    log_max_bytes: int = 2_000_000
+    log_backup_count: int = 3
 
     @property
     def config_dir(self) -> Path:
@@ -187,6 +199,11 @@ class AgentConfig:
         path = path or self.config_dir / "config.json"
         path.write_text(json.dumps(asdict(self), indent=2))
         return path
+
+    def to_json(self) -> str:
+        """JSON view used by the control plane (`ctl config`) and diagnostics.
+        Secrets never live in config (KDE Wallet only), so nothing to redact."""
+        return json.dumps(asdict(self), ensure_ascii=False)
 
 
 def _merge(obj, raw: dict) -> None:
