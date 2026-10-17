@@ -55,15 +55,16 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
                                       axis=0))
         sq = f"emb_sq_{i}"
         nodes.append(helper.make_node("Cast", [emb], [sq], to=TensorProto.FLOAT))
+        # emb is [1,1,D] (input_ids is [1,1]); flatten straight to [D].
         flat = f"emb_flat_{i}"
         nodes.append(helper.make_node("Reshape", [sq, "shape_1d"], [flat]))
         st = f"state_{i}"
-        # state_in is [L, 1, D] (contract): Gather over axis 0 selects the
-        # layer slot -> [1, D].
+        # state_in is [L, 1, D] (contract): Gather axis0 -> [1,D], squeeze -> [D].
         nodes.append(helper.make_node("Gather", ["state_in", f"idx_{i}"], [st],
                                       axis=0))
         sflat = f"state_flat_{i}"
         nodes.append(helper.make_node("Reshape", [st, "shape_1d"], [sflat]))
+        # emb path: Cast gave [1,D]; flatten to [D] so all hiddens are 1-D.
         # x' = tanh(state @ A_rec^T + emb @ B_inp^T)   (one SSM-ish step)
         rs = f"rec_{i}"
         nodes.append(helper.make_node("MatMul", [sflat, "A_rec_T"], [rs]))
@@ -77,8 +78,10 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
             # carry hidden into next layer's slot of state_out.
             # th is [1, D]; unsqueeze axis 0 -> [1, 1, D] which matches the
             # ScatterND slice shape data[indices[-1]:] for a [L,1,D] tensor.
+            # indices [[i,0]] (shape [1,2]) -> required updates shape is
+            # indices.shape[:-1] + data.shape[2:] == [1, D] (verified on ORT 1.31).
             us2 = f"us2_{i}"
-            nodes.append(helper.make_node("Unsqueeze", [th, "axes_neg1"], [us2]))
+            nodes.append(helper.make_node("Reshape", [th, "shape_1xd"], [us2]))
             nodes.append(helper.make_node("ScatterND",
                                           ["state_in", f"scatter_idx_{i}", us2],
                                           [f"so_{i}"]))
@@ -101,11 +104,13 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     pbe = "pos_bias_e"
     nodes.append(helper.make_node("Expand", [pbt, "shape_logits"], [pbe]))
     lg0 = "logits_pre"
-    nodes.append(helper.make_node("MatMul", [final_hid, "C_out"], [lg0]))
+    fh2 = "final_hid_2d"
+    nodes.append(helper.make_node("Reshape", [final_hid, "shape_1xd"], [fh2]))
+    nodes.append(helper.make_node("MatMul", [fh2, "C_out"], [lg0]))
     nodes.append(helper.make_node("Add", [lg0, pbe], ["logits"]))
     # last layer writes its hidden back into state slot L-1
     usl = "usl"
-    nodes.append(helper.make_node("Unsqueeze", [final_hid, "axes_neg1"], [usl]))
+    nodes.append(helper.make_node("Reshape", [final_hid, "shape_1xd"], [usl]))
     nodes.append(helper.make_node("ScatterND",
                                   [f"so_{layers - 2}" if layers > 1 else "state_in",
                                    f"scatter_idx_{layers - 1}", usl],
@@ -129,7 +134,9 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
         inits.append(numpy_helper.from_array(v, k))
     for i in range(layers):
         inits.append(numpy_helper.from_array(np.array([[i]], dtype=np.int64), f"idx_{i}"))
-        inits.append(numpy_helper.from_array(np.array([[[i]]], dtype=np.int64),
+        # indices shape [1,2]: one (layer,beam) tuple -> ORT slices data[i,0,:]
+        # giving [D]; required updates shape = indices.shape[:-1]+[D] = [1,D].
+        inits.append(numpy_helper.from_array(np.array([[i, 0]], dtype=np.int64),
                                              f"scatter_idx_{i}"))
 
     g_inputs = [
