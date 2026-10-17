@@ -306,17 +306,19 @@ class ProposalEngine:
         for s in siblings:
             if s.lower() == low:
                 continue
-            wd = weighted_distance(low, s.lower())
-            # same acceptance gate as the invariant for paths:
-            # wdist <= max(2, len*0.55) AND char_jaccard >= 0.5 — without the
-            # jaccard floor unrelated sibling names (Documents vs projects)
-            # slip through on long segments and create false positives
-            if wd <= max(2.0, len(low) * 0.55) and char_jaccard(low, s.lower()) >= 0.5:
+            sl = s.lower()
+            wd = weighted_distance(low, sl)
+            # a sibling is only a plausible typo TARGET if the two names share
+            # most letters (jaccard >= 0.5). 'projects' vs 'Documents' has raw
+            # edit distance ~4 but zero finger-slip relation -> never propose.
+            jac = char_jaccard(low, sl)
+            if wd <= max(2.0, len(low) * 0.55) and jac >= 0.5:
                 # target_exists: verified live fact — the sibling is present on
                 # disk right now (checked again at judgement time below)
                 cands.append(Candidate(s, "path_segment", "filesystem",
                                        {"wdist": round(wd, 2),
                                         "rel": round(wd / max(1, len(low)), 3),
+                                        "jac": round(jac, 3),
                                         "target_exists": True}))
         # learned-dict candidates must be VERIFIED against the live filesystem:
         # a personal token only qualifies if a name that close actually exists
@@ -418,7 +420,15 @@ class MockModelAnalyzer(ModelTypoAnalyzer):
             seg, cands = res
             if self._declared_intentional(seg, lex):
                 continue                     # user said: intentional — never nag twice
-            v = self._judge(seg, cands, "path_segment", original=raw)
+            # Learned-dict candidates are WEAK evidence for paths: a brand-new
+            # legitimate name (~/projects vs known ~/Documents) merely looks
+            # similar. Only verified filesystem siblings / layout decodes can
+            # raise a path flag here.
+            strong = [c for c in cands
+                      if c.source == "filesystem" or c.source == "layout"]
+            if not strong:
+                continue
+            v = self._judge(seg, strong, "path_segment", original=raw)
             if v:
                 verdicts.append(v)
 
