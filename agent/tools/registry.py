@@ -17,8 +17,9 @@ CMD_TIMEOUT = 30
 
 
 class ToolRegistry:
-    def __init__(self, cfg, memory, safety, bridge):
+    def __init__(self, cfg, memory, safety, bridge, cards=None):
         self.cfg, self.memory, self.safety, self.bridge = cfg, memory, safety, bridge
+        self.cards = cards          # CardStore | None (knowledge subsystem)
         self.last_undo: tuple | None = None
         self._term_history: list[tuple[str, str]] = []
         self._tools = {
@@ -37,6 +38,7 @@ class ToolRegistry:
             "confirm_dialog": self.confirm_dialog,
             "rag_search": self.rag_search,
             "memory_search": self.memory_search,
+            "card_search": self.card_search,
             "set_reminder": self.set_reminder,
             "dbus_call": self.dbus_call,
             "update_widget": self.update_widget,
@@ -175,6 +177,28 @@ class ToolRegistry:
                                   top_k or self.cfg.rag.top_k)
         return "\n".join(f"({h.collection}/{h.meta.get('kind','')}) [{h.score:.2f}] {h.text[:200]}"
                          for h in hits) or "NO_RESULTS"
+
+    def card_search(self, query: str, types: list[str] | None = None,
+                    top_k: int = 4) -> str:
+        """Knowledge-card retrieval with source attribution (spec: режим
+        объяснения источника — each hit carries its provenance)."""
+        cards = self.cards
+        if cards is None:
+            return "DISABLED: подсистема знаний выключена (knowledge.enabled=false)."
+        found = cards.search(query, top_k=top_k,
+                             types=tuple(types) if types else None)
+        if not found:
+            return "NO_CARDS: карточек по запросу нет — предложите пользователю источник (/index <dir>) или задайте вопрос напрямую."
+        out = []
+        for c in found:
+            src = c.meta.get("source", "?")
+            lines = c.meta.get("lines", [0, 0])
+            out.append(f"#{c.id} v{c.version} [{c.type}] {c.summary}\n"
+                       f"{c.body[:500]}\n"
+                       f"(источник: {src}:{lines[0]}-{lines[1]}, "
+                       f"value={c.value:.2f}, use={c.usages})")
+            cards.record_usage(c.id)   # retrieval counts as a usage signal
+        return "\n---\n".join(out)
 
     def set_reminder(self, text: str, minutes: int = 10) -> str:
         self.memory.add("reminders", text, "reminder", {"due": time.time() + minutes * 60})

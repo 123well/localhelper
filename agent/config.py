@@ -86,6 +86,25 @@ class RagConfig:
 
 
 @dataclass
+class KnowledgeConfig:
+    enabled: bool = True              # whole subsystem switchable off (spec)
+    dedup_high: float = 0.93          # >= : near-duplicate merge band
+    dedup_low: float = 0.84           # [low,high) + different summary -> conflict
+    max_segments_per_source: int = 40
+    study_priority_default: int = 5   # lower = studied first
+    sandbox_examples: bool = True     # run doc examples only in sandbox
+    mask_secrets: bool = True         # privacy gate before DB writes (never disable in prod)
+
+
+@dataclass
+class CodeAssistConfig:
+    enabled: bool = True
+    gates: dict = field(default_factory=lambda: {"explain": 0.45, "snippet": 0.6, "edit": 0.75})
+    run_tests: bool = True            # pytest step of the verification ladder
+    test_timeout_sec: float = 60.0
+
+
+@dataclass
 class SleepConfig:
     enabled: bool = True
     train_at_idle_min: int = 20       # mini-training after this idle
@@ -110,6 +129,8 @@ class AgentConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     initiative: InitiativeConfig = field(default_factory=InitiativeConfig)
     rag: RagConfig = field(default_factory=RagConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
+    code_assist: CodeAssistConfig = field(default_factory=CodeAssistConfig)
     sleep: SleepConfig = field(default_factory=SleepConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
     log_level: str = "INFO"
