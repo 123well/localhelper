@@ -41,6 +41,7 @@ class Card:
     examples: list[str] = field(default_factory=list)
     phrases: list[str] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
+    item_id: int | None = None
     value: float = 1.0
     usages: int = 0
     helpful: int = 0
@@ -69,9 +70,10 @@ class CardStore:
             summary TEXT, body TEXT, examples TEXT, phrases TEXT, meta TEXT,
             item_id INTEGER, usages INTEGER DEFAULT 0, helpful INTEGER DEFAULT 0,
             not_helpful INTEGER DEFAULT 0, created REAL, updated REAL)""")
+        # NOTE: "drop" is a reserved SQL keyword -> quote the column names.
         self.db.execute("""CREATE TABLE IF NOT EXISTS card_conflicts(
-            keep INTEGER, drop INTEGER, note TEXT, resolved INTEGER DEFAULT 0,
-            ts REAL)""")
+            "keep" INTEGER, "drop" INTEGER, note TEXT,
+            resolved INTEGER DEFAULT 0, ts REAL)""")
         self.db.commit()
 
     # ------------------------------------------------------------------ write
@@ -91,7 +93,7 @@ class CardStore:
             other = self.get(best_id)
             # newer source wins provisionally, old one flagged for review
             cur = self.db.execute(
-                "INSERT INTO card_conflicts(keep,drop,note,ts) VALUES(?,?,?,?)",
+                'INSERT INTO card_conflicts("keep","drop",note,ts) VALUES(?,?,?,?)',
                 (None, other.id, f"similar {best_sim:.2f} to #{other.id}", time.time()))
             self.db.commit()
 
@@ -147,6 +149,7 @@ class CardStore:
         return Card(id=row[0], version=row[1], type=row[2], summary=row[3],
                     body=row[4], examples=json.loads(row[5]),
                     phrases=json.loads(row[6]), meta=json.loads(row[7]),
+                    item_id=row[8],
                     value=value, usages=row[9], helpful=row[10],
                     not_helpful=row[11], ts=row[12])
 
@@ -195,7 +198,7 @@ class CardStore:
     # ---------------------------------------------------------------- conflicts
     def pending_conflicts(self) -> list[tuple[Card, int]]:
         rows = self.db.execute(
-            "SELECT rowid, drop FROM card_conflicts WHERE resolved=0").fetchall()
+            'SELECT rowid, "drop" FROM card_conflicts WHERE resolved=0').fetchall()
         out = []
         for rid, drop in rows:
             c = self.get(drop)
@@ -206,8 +209,9 @@ class CardStore:
     def resolve_conflict(self, keep_id: int, drop_id: int) -> None:
         """Human decision: 'keep' survives unchanged, 'drop' is tombstoned."""
         self.db.execute(
-            "UPDATE card_conflicts SET resolved=1, keep=?, note=note||' [resolved]' "
-            "WHERE keep IS NULL AND drop=?", (keep_id, drop_id))
+            'UPDATE card_conflicts SET resolved=1, "keep"=?, '
+            "note=note||' [resolved]' "
+            'WHERE "keep" IS NULL AND "drop"=?', (keep_id, drop_id))
         self.db.commit()
         if keep_id != drop_id:
             self.remove(drop_id)
