@@ -18,13 +18,21 @@ CMD_TIMEOUT = 30
 # Tools that change system state (execution/writes/GUI input). Everything else
 # is observational (read/search/list) and stays allowed in safe/read_only modes.
 MUTATING_TOOLS = {"exec_command", "write_file", "click", "type_text", "open_app",
-                  "dbus_call", "undo_last", "propose_automation"}
+                  "dbus_call", "undo_last", "propose_automation",
+                  "close_window", "focus_window", "run_scenario"}
 
 
 class ToolRegistry:
-    def __init__(self, cfg, memory, safety, bridge, cards=None):
+    def __init__(self, cfg, memory, safety, bridge, cards=None,
+                 winstate=None, winprober=None, scenarios=None):
         self.cfg, self.memory, self.safety, self.bridge = cfg, memory, safety, bridge
         self.cards = cards          # CardStore | None (knowledge subsystem)
+        # window/scenario collaborators (wired by Agent after construction;
+        # None until then — the tools below degrade with a clear message)
+        self.winstate = winstate
+        self.winprober = winprober
+        self.scenarios = scenarios          # ScenarioStore | None
+        self.scenario_runner = None         # ScenarioRunner | None
         self.last_undo: tuple | None = None
         # Code assistant registers text-edit undo entries here (kind "edit").
         self._undo_edits: list[tuple] = []
@@ -51,6 +59,14 @@ class ToolRegistry:
             "update_widget": self.update_widget,
             "propose_automation": self.propose_automation,
             "undo_last": self.undo_last,
+            # --- windows (initiative layer) & scenarios (skills) ---------
+            "list_windows": self.list_windows,
+            "close_window": self.close_window,
+            "focus_window": self.focus_window,
+            "suggest_apps_for_context": self.suggest_apps_for_context,
+            "save_scenario": self.save_scenario,
+            "run_scenario": self.run_scenario,
+            "list_scenarios": self.list_scenarios,
         }
 
     def names(self) -> list[str]:
@@ -302,3 +318,80 @@ class ToolRegistry:
         msg = self.safety.undo(snap, backup)
         self.memory.episode("undo", msg, value=1.2)
         return msg
+
+    # ---------------- windows (initiative layer; suggestions->actions) ----
+    def list_windows(self) -> str:
+        st = self.winstate
+        if st is None:
+            return "DISABLED: оконный слой не подключён"
+        if not st.windows and self.winprober is not None:
+            return "INFO: снимок окон ещё не снят (нет kdotool/kwin-сигналов или окно событий пусто)"
+        rows = [{"wid": w.wid, "class": w.cls, "title": w.title, "active": w.active,
+                 "idle_min": round((time.time() - w.last_focus) / 60)}
+                for w in sorted(st.windows.values(), key=lambda x: x.last_focus)]
+        return json.dumps(rows, ensure_ascii=False)
+
+    def close_window(self, wid: str, confirmed: bool = False) -> str:
+        """NEVER automatic: confirmation is mandatory even when the safety
+        mode is normal (spec: закрытие несохранённых окон — опасная операция)."""
+        if not confirmed:
+            q = f"Закрыть окно {wid}? Несохранённые данные могут потеряться."
+            if not self.bridge.confirm(q, dangerous=True):
+                self.memory.episode("cancel", f"user refused closing window {wid}")
+                return "CANCELLED_BY_USER: окно не закрыто."
+        p = self.bridge.kdotool("closewindow", str(wid))
+        if p.returncode != 0:
+            return f"ERROR: kdotool closewindow не удался ({p.stderr.strip() or 'rc=%d' % p.returncode})"
+        if self.winstate is not None:
+            w = self.winstate.windows.get(str(wid))
+            if w:
+                self.winstate.mark_closed_by_user(w.key())
+        self.memory.episode("window_closed", f"closed {wid} (confirmed)")
+        return f"OK: окно {wid} закрыто по подтверждению пользователя"
+
+    def focus_window(self, wid: str) -> str:
+        p = self.bridge.kdotool("activatewindow", str(wid))
+        if p.returncode != 0:
+            return f"ERROR: activatewindow: {p.stderr.strip() or 'rc=%d' % p.returncode}"
+        return f"OK: окно {wid} активно"
+
+    def suggest_apps_for_context(self, keyword: str) -> str:
+        st = self.winstate
+        if st is None:
+            return "DISABLED: оконный слой не подключён"
+        sugg = st.suggest_for_context(keyword)
+        comp = st.companions(sugg[0][0]) if sugg else []
+        return json.dumps({"for_context": keyword, "apps": sugg,
+                           "companions_of_first": comp}, ensure_ascii=False)
+
+    # ---------------- scenarios (saved skills) ----------------------------
+    def save_scenario(self, name: str, description: str, steps: list,
+                      params: list | None = None, expected: str = "") -> str:
+        store = self.scenarios
+        if store is None:
+            return "DISABLED: подсистема сценариев не подключена"
+        try:
+            sid = store.save(name, description, steps, params=params,
+                             precondition={"mode_not_safe": True},
+                             expected=expected, known_tools=self)
+        except ValueError as e:
+            return f"ERROR: сценарий не сохранён: {e}"
+        self.memory.episode("scenario_saved", f"{name} ({len(steps)} шагов)")
+        return f"OK: сценарий «{name}» сохранён (id={sid}, шагов: {len(steps)})"
+
+    async def run_scenario(self, name: str, params: dict | None = None) -> str:
+        runner = self.scenario_runner
+        if runner is None:
+            return "DISABLED: подсистема сценариев не подключена"
+        rep = await runner.run(name, params or {})
+        return json.dumps(rep, ensure_ascii=False)
+
+    def list_scenarios(self) -> str:
+        store = self.scenarios
+        if store is None:
+            return "DISABLED: подсистема сценариев не подключена"
+        rows = store.list()
+        return "\n".join(f"{s['name']} — {s['description'][:60]} "
+                         f"(шагов:{s['steps']}, запусков:{s['runs']}, "
+                         f"успехов:{s['successes']}, value:{s['value']})"
+                         for s in rows) or "Сценариев пока нет."

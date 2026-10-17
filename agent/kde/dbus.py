@@ -38,6 +38,8 @@ class KDEBridge:
         # on every notification attempt in headless mode).
         self.available = False
         self.reply_hooks: dict[str, Callable[[str], None]] = {}
+        self._id_to_key: dict[int, str] = {}     # notif id -> reply_key
+        self._awaiting_key: str | None = None    # last sent keyed notification
 
     # ---------- connection ------------------------------------------------
     async def connect(self) -> bool:
@@ -49,6 +51,14 @@ class KDEBridge:
             self._notif = self.bus.get_object(
                 "org.freedesktop.Notifications",
                 "/org/freedesktop/Notifications").get_interface(introspec)
+            # notification button presses (Принять/Отклонить) come back as
+            # org.freedesktop.Notifications.ActionInvoked(id, action_key).
+            # Without this the whole feedback loop of initiative lived only in
+            # the terminal (/feedback) — spec requires closing it via desktop.
+            try:
+                self._notif.on_action_invoked(self._on_action_invoked)
+            except AttributeError:
+                log.debug("ActionInvoked signal unavailable on this server")
             self.available = True
             log.info("connected to plasmashell notifications")
             return True
@@ -67,15 +77,40 @@ class KDEBridge:
         if self._notif is None:
             log.info("[notify:%s] %s — %s %s", urgency, title, body, actions or "")
             return
+        self._awaiting_key = reply_key
         try:
             asyncio.get_running_loop().create_task(self._notify_async(title, body, actions, urgency, timeout_ms))
         except RuntimeError:
             self._notify_sync(title, body)
 
     async def _notify_async(self, title, body, actions, urgency, timeout_ms) -> None:
-        reply = await self._notif.call_notify(
-            "KDE Agent", 0, "", title, body, actions or [], {"urgency": _u(urgency)}, timeout_ms)
-        log.info("notification id=%s", reply)
+        # dbus-next renders snake_case members: call_notify -> Notify,
+        # on_action_invoked -> ActionInvoked (verified against dbus_next README
+        # codegen rules; guarded by try/except so a wrong guess degrades to
+        # "no click feedback", never to a crash).
+        flat = [k for a in (actions or []) for k in ("", a)]  # id,key,label triples: empty ids ok
+        try:
+            reply = await self._notif.call_notify(
+                "KDE Agent", 0, "", title, body, flat, {"urgency": _u(urgency)}, timeout_ms)
+            log.info("notification id=%s", reply)
+            nid = reply[0] if isinstance(reply, (list, tuple)) and reply else None
+            if getattr(self, "_awaiting_key", None):
+                self._id_to_key[nid] = self._awaiting_key
+                self._awaiting_key = None
+        except Exception as e:  # noqa: BLE001
+            log.debug("notify failed: %s", e)
+
+    # ---------- notification click -> reaction pipeline ---------------------
+    def _on_action_invoked(self, notification_id, action_key) -> None:
+        key = self._id_to_key.pop(notification_id, None)
+        if not key:
+            return
+        hook = self.reply_hooks.get(key)
+        if hook:
+            try:
+                hook(str(action_key))
+            except Exception:  # noqa: BLE001
+                log.exception("reply hook failed for %s", key)
 
     def _notify_sync(self, title: str, body: str) -> None:
         if shutil.which("kdialog"):

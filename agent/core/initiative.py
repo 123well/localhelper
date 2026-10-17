@@ -440,6 +440,16 @@ class InitiativeEngine:
             self.habits.last_seen[iv.type] = time.time()   # start cooldown
             self.habits.hour_log.append(time.time())       # consume hourly budget
             if self.notifier:
+                # real KDE notification channel. The reply hook closes the
+                # feedback loop: ActionInvoked (Принять/Отклонить click) ->
+                # habits.resolve -> threshold/utility update persisted.
+                key_hook = key
+                def _on_click(act: str, _k=key_hook) -> None:
+                    reaction = {"default": "yes", "accept": "yes", "принять": "yes",
+                                "reject": "нет", "отклонить": "нет"}.get(
+                        str(act).lower(), str(act))
+                    self.feedback(_k, reaction)
+                self.notifier.reply_hooks[key] = _on_click
                 self.notifier.notify("KDE Agent", iv.message,
                                      actions=["Принять", "Отклонить"], reply_key=key)
             else:
