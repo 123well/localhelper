@@ -87,7 +87,8 @@ async def _daemon_main(interactive: bool = False) -> int:
     request tears everything down gracefully (no orphan background work)."""
     import signal
     from agent.main import Agent
-    ag = Agent()
+    ag = Agent(interactive=interactive)   # `run` keeps the stdin REPL;
+                                          # `daemon` must never attach to fd 0
     loop = asyncio.get_running_loop()
 
     # ---- single-instance guard ---------------------------------------------
