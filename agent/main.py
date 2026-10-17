@@ -278,7 +278,9 @@ class Agent(ControlMixin):
         elif cmd == "sleep":
             rep(self.control("sleep", arg))
         elif cmd == "study":
-            rep(self.control("study", ("add " + arg) if arg.startswith("add ") else arg))
+            # /study add <файл|dir> -> control("study", "add ..."); иначе аргумент
+            # передаётся как есть (число = бюджет секунд, stop/queue).
+            rep(self.control("study", arg))
         elif cmd == "index":
             if self.study is not None:
                 n = self.study.ingest_dir(arg or str(Path.cwd()),

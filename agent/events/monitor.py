@@ -72,7 +72,7 @@ class StdinSource:
         try:
             protocol = asyncio.StreamReaderProtocol(reader)
             await loop.connect_read_pipe(lambda: protocol, __import__("sys").stdin)
-        except (OSError, ValueError):        # not a tty (tests)
+        except (OSError, ValueError, PermissionError):        # not a tty (tests)
             return
         while True:
             raw = await reader.readline()

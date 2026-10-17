@@ -85,7 +85,9 @@ CONTROL_HELP = {
     "sleep stop":        "остановить сон/фоновое обучение немедленно",
     "sleep last":        "отчёт последнего сна",
     "study [бюджет_сек]": "принудительный прогон очереди фонового изучения",
-    "study add <dir>":   "поставить директорию/файл в очередь изучения",
+    "study stop":        "принудительная остановка фонового обучения",
+    "study queue":       "состояние очереди изучения",
+    "study add <файл|dir>": "поставить файл или директорию в очередь изучения",
     "kb stats":          "статус базы знаний (карточки, конфликты, устаревшие)",
     "kb list":           "последние карточки знаний",
     "kb search <запрос>":"поиск по карточкам",
@@ -145,11 +147,14 @@ class ControlMixin:
                 self.cfg.save()
                 return {"ok": True, "proactivity": on}
             if name == "sleep":
-                if arg.strip() == "stop":
+                a = arg.strip().lower()
+                if a in ("stop", "останов"):
                     self._sleep_stop_event.set()
                     self._bg_learning_paused = True
                     return {"ok": True, "sleep": "stopped/paused"}
-                if arg.strip() == "last":
+                if a in ("last", "report", "отчёт"):
+                    # фикс парсинга: `ctl sleep last` раньше отдавал
+                    # неизвестную команду, потому что аргумент не нормализовался
                     p = self.cfg.data_dir / "last_sleep.json"
                     return json.loads(p.read_text()) if p.exists() else {"skipped": "нет данных"}
                 rep = self.trainer.sleep_cycle()
@@ -160,12 +165,35 @@ class ControlMixin:
             if name == "study":
                 if self.study is None:
                     return {"ok": False, "error": "knowledge subsystem disabled"}
-                if arg.strip().startswith("add"):
-                    path = arg.split(maxsplit=1)[1] if " " in arg else ""
-                    n = self.study.ingest_dir(path or str(self.cfg.data_dir))
-                    return {"ok": True, "queued": n}
+                a = arg.strip()
+                if a.startswith("add"):
+                    # `study add <файл|директория>` — раньше путь считался
+                    # только директорией; одиночный README/man-файл молча
+                    # не попадал в очередь (rglob по файлу пустой).
+                    path = a.split(maxsplit=1)[1].strip() if " " in a else ""
+                    if not path:
+                        return {"ok": False, "error": "study add <путь к файлу или директории>"}
+                    from pathlib import Path as _P
+                    pp = _P(path).expanduser()
+                    if not pp.exists():
+                        return {"ok": False, "error": f"путь не найден: {pp}"}
+                    prio = self.cfg.knowledge.study_priority_default
+                    if pp.is_dir():
+                        n = self.study.ingest_dir(str(pp), priority=prio)
+                    else:
+                        from agent.knowledge.pipeline import Source
+                        self.study.queue.enqueue(Source(path=str(pp), priority=prio))
+                        n = 1
+                    return {"ok": True, "queued": n, "path": str(pp)}
+                if a == "stop":
+                    # принудительная остановка фонового обучения (spec)
+                    self._bg_learning_paused = True
+                    return {"ok": True, "study": "paused"}
+                if a == "queue":
+                    return {"ok": True, "queue": self.study.queue.stats()}
+                budget = float(a) if a.replace(".", "", 1).isdigit() else 20.0
                 self._bg_learning_paused = False
-                reps = self.study.run_pending(budget_sec=float(arg or 20))
+                reps = self.study.run_pending(budget_sec=budget)
                 return {"ok": True, "processed": len(reps), "queue": self.study.queue.stats()}
             if name == "kb":
                 return self._ctl_kb(arg)
@@ -244,24 +272,25 @@ class ControlMixin:
     def _kb_reindex(self) -> dict:
         """Recompute vectors for every item with the current frozen encoder
         (needed after swapping the embedder implementation)."""
-        rows = self.memory.db.execute("SELECT id,text FROM items").fetchall()
+        rows = self.memory._exec("SELECT id,text FROM items").fetchall()
         for rid, text in rows:
             vec = self.memory.embedder.embed(text)
-            self.memory.db.execute("UPDATE items SET vec=? WHERE id=?",
-                                   (vec.astype("float32").tobytes(), rid))
-        self.memory.db.commit()
+            self.memory._exec("UPDATE items SET vec=? WHERE id=?",
+                              (vec.astype("float32").tobytes(), rid))
+        self.memory._commit()
         self.memory._cache = None
         return {"ok": True, "reindexed": len(rows)}
 
     def _kb_clear(self, coll: str) -> dict:
         if coll == "all":
             q = "DELETE FROM items"; n = "items"
-            self.memory.db.execute("DELETE FROM cards"); self.memory.db.execute("DELETE FROM card_conflicts")
+            self.memory._exec("DELETE FROM cards")
+            self.memory._exec("DELETE FROM card_conflicts")
         else:
             q = "DELETE FROM items WHERE collection=?"; n = coll
             if coll == "cards":
-                self.memory.db.execute("DELETE FROM cards")
-        cur = self.memory.db.execute(q, () if coll == "all" else (coll,))
-        self.memory.db.commit()
+                self.memory._exec("DELETE FROM cards")
+        cur = self.memory._exec(q, () if coll == "all" else (coll,))
+        self.memory._commit()
         self.memory._cache = None
         return {"ok": True, "deleted": cur.rowcount, "collection": n}

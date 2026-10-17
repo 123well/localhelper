@@ -34,6 +34,12 @@ class ContextManager:
     turns: deque = field(default_factory=deque)
     summaries: list[str] = field(default_factory=list)
 
+    @property
+    def hard_cap(self) -> int:
+        """Absolute turn ceiling independent of the token budget. An always-on
+        daemon that only pins high-score turns would otherwise grow forever."""
+        return max(64, self.budget_tokens // 8)
+
     def add(self, role: str, text: str, score: float = 1.0, pinned: bool = False) -> None:
         self.turns.append(Turn(role, text, score, pinned))
         self._fit()
@@ -49,22 +55,35 @@ class ContextManager:
         return s[:400]
 
     def _fit(self) -> None:
+        # Hard cap on turn count: protects the always-on daemon from unbounded
+        # deque growth even when every old turn is pinned / high-score.
+        while len(self.turns) > self.hard_cap:
+            dropped = self.turns.popleft()
+            self._fold_summary(dropped)
         while self.total() > self.budget_tokens and len(self.turns) > self.recent_keep:
             # evict lowest-score non-pinned oldest first
             cand = min(((i, t) for i, t in enumerate(self.turns[:-self.recent_keep])
                         if not t.pinned), key=lambda it: (it[1].score, it[0]), default=None)
             if cand is None:
-                break
+                # ALL older turns are pinned: fold them into summaries so the
+                # budget still bounds memory (summaries list itself is capped).
+                dropped = self.turns.popleft()
+                self._fold_summary(dropped)
+                continue
             old = self.turns[cand[0]]
             del self.turns[cand[0]]
-            if self.summaries and _approx_tokens(self.summaries[-1]) < 60:
-                self.summaries[-1] = self._summarize(
-                    [Turn("summary", self.summaries[-1])] + [old])
-            else:
-                self.summaries.append(self._summarize([old]))
-            while len(self.summaries) > 6:
-                head = self.summaries[:3]
-                self.summaries = [self._summarize([Turn("s", " || ".join(head))])] + self.summaries[3:]
+            self._fold_summary(old)
+
+    def _fold_summary(self, old: "Turn") -> None:
+        """Fold an evicted turn into the rolling summary list (bounded)."""
+        if self.summaries and _approx_tokens(self.summaries[-1]) < 60:
+            self.summaries[-1] = self._summarize(
+                [Turn("summary", self.summaries[-1])] + [old])
+        else:
+            self.summaries.append(self._summarize([old]))
+        while len(self.summaries) > 6:
+            head = self.summaries[:3]
+            self.summaries = [self._summarize([Turn("s", " || ".join(head))])] + self.summaries[3:]
 
     def total(self) -> int:
         return (_approx_tokens(" ".join(self.summaries))
