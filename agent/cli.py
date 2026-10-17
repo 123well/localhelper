@@ -14,9 +14,15 @@ import sys
 
 def _socket_path():
     """Per-user control socket (0600). Shared by daemon and ctl clients so
-    they can never cross-talk between users on multi-user systems."""
+    they can never cross-talk between users on multi-user systems.
+    KDE_AGENT_DATA overrides the socket dir too — a fully isolated test
+    instance (data + state + socket) needs exactly ONE env var."""
     import os
     from pathlib import Path
+    iso = os.environ.get("KDE_AGENT_DATA")
+    if iso:
+        Path(iso).mkdir(parents=True, exist_ok=True)
+        return str(Path(iso) / "kde-agent.ctl.sock")
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         runtime = f"/tmp/kde-agent-{os.getuid()}"
@@ -157,7 +163,23 @@ async def _daemon_main(interactive: bool = False) -> int:
     return rc
 
 
+def _apply_data_isolation() -> None:
+    """KDE_AGENT_DATA=<dir>: isolate data+state (and therefore the lock file,
+    KB, queue, adapters) for testing without touching the real profile.
+    Must run BEFORE AgentConfig.load()."""
+    import os
+    from pathlib import Path
+    iso = os.environ.get("KDE_AGENT_DATA")
+    if not iso:
+        return
+    p = Path(iso).expanduser().resolve()
+    os.environ.setdefault("XDG_DATA_HOME", str(p))
+    os.environ.setdefault("XDG_STATE_HOME", str(p / "state"))
+    os.environ.setdefault("XDG_CONFIG_HOME", str(p / "config"))
+
+
 def main(argv=None) -> int:
+    _apply_data_isolation()
     p = argparse.ArgumentParser(prog="kde-agent", description="Autonomous KDE Plasma 6 agent (Stage 1 prototype)")
     sub = p.add_subparsers(dest="cmd")
 
@@ -169,12 +191,20 @@ def main(argv=None) -> int:
 
     pc = sub.add_parser("ctl", help="send a control command to the running daemon")
     pc.add_argument("command")
-    pc.add_argument("arg", nargs="*", default=[])
+    # REMAINDER: flags like `ctl study run --max 5 --force` must reach the
+    # daemon verbatim; with nargs="*" argparse rejected them (bad usage).
+    pc.add_argument("arg", nargs=argparse.REMAINDER, default=[])
 
     pi = sub.add_parser("index", help="index documentation into RAG")
     pi.add_argument("path")
 
     sub.add_parser("demo", help="scripted end-to-end demo (initiative, RPE, RAG, sleep)")
+
+    pa = sub.add_parser("ask", help="быстрый RAG-вопрос: через живого демона или напрямую")
+    pa.add_argument("question", nargs="+")
+
+    pl = sub.add_parser("logs", help="хвост лога демона (по умолчанию 40 строк)")
+    pl.add_argument("-n", dest="nlines", type=int, default=40)
 
     pe = sub.add_parser("export-adapters", help="merge trained adapter into ONNX INT4 graph (needs onnxruntime+weights)")
     pe.add_argument("--adapter", required=True)
@@ -220,6 +250,17 @@ def main(argv=None) -> int:
         n = index_docs(mem, args.path)
         print(f"indexed {n} chunks into {cfg.db_path}")
         return 0
+    if args.cmd == "ask":
+        return _cmd_ask(" ".join(args.question))
+    if args.cmd == "logs":
+        from agent.config import AgentConfig
+        lp = AgentConfig.load().log_path
+        if not lp.exists():
+            print(f"лог не найден: {lp}")
+            return 1
+        tail = lp.read_text(errors="replace").splitlines()[-args.nlines:]
+        print("\n".join(tail))
+        return 0
     if args.cmd == "demo":
         from agent.demo import run_demo
         logging.basicConfig(level=logging.WARNING)
@@ -235,6 +276,36 @@ def main(argv=None) -> int:
         return {"ok": 0, "warn": 0, "fail": 1}[rep["worst"]]
     p.print_help()
     return 1
+
+
+def _cmd_ask(question: str) -> int:
+    """RAG question: prefer the live daemon (shared DB), else direct one-shot."""
+    try:
+        resp = _send_ctl("ask", question)
+        if resp.get("ok"):
+            print(resp.get("answer", ""))
+            return 0
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        pass
+    # cold path: no daemon — start agent in-process, ask, shut down.
+    async def _once():
+        from agent.main import Agent
+        ag = Agent(interactive=False)
+        await ag.bridge.connect()
+        ag.subscribe()
+        try:
+            hits = ag.memory.search(question, collections=("docs", "cards"), top_k=3)
+            ctx = "\n---\n".join(h.text[:500] for h in hits)
+            prompt = f"Вопрос: {question}\nКонтекст из базы знаний:\n{ctx}" if ctx else question
+            return await ag.think_loop(prompt)
+        finally:
+            await ag.shutdown("cli-ask")
+    try:
+        print(asyncio.run(_once()))
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"fatal: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

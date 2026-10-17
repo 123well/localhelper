@@ -328,18 +328,32 @@ class StudyPipeline:
         score = best if asked else 1.0
         return score >= threshold, score
 
-    def run_pending(self, budget_sec: float = 20.0) -> list[dict]:
-        """Respect the energy gate; drain queue within wall-clock budget."""
-        allowed, why = self.gate.allow_heavy_work()
+    def run_pending(self, budget_sec: float = 20.0,
+                    max_docs: int | None = None,
+                    force: bool = False) -> list[dict]:
+        """Respect the energy gate; drain queue within wall-clock budget.
+        `max_docs` bounds how many documents are processed per call.
+        `force=True` skips the gate — ONLY for explicit user commands
+        (`ctl study run`, `/study`), never for automatic background batches."""
+        if force:
+            allowed, why = True, "forced by user command"
+        else:
+            allowed, why = self.gate.allow_heavy_work()
         if not allowed:
             log.info("study deferred: %s", why)
             return []
         reports, t0 = [], time.time()
         while time.time() - t0 < budget_sec:
+            if max_docs is not None and len(reports) >= max_docs:
+                break
             src = self.queue.next()
             if src is None:
                 break
-            reports.append(self.process_one(src))
+            try:
+                reports.append(self.process_one(src))
+            except Exception as e:  # noqa: BLE001  one broken doc must not kill the batch
+                log.exception("study: source %s failed (marked retry)", src.path)
+                self.queue.mark(src.path, "failed", error=str(e)[:200])
         # housekeeping (spec: consolidation during idle): merge/dedup review,
         # conflicts report, restudy-flagged cards get requeued occasionally.
         try:
