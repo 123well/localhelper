@@ -91,25 +91,19 @@ class MockBackend:
 
 
 class OnnxNpuBackend:
-    """ONNX Runtime + XDNA EP. SSM streaming: hidden state carried between calls."""
+    """Thin wrapper kept for API compatibility; real work is in agent.core.onnx_model."""
 
-    def __init__(self, model_path: str, providers: list[str] | None = None):
-        import onnxruntime as ort  # lazy import: not needed on dev boxes
-        self.sess = ort.InferenceSession(
-            model_path,
-            providers=providers or ["XDNAExecutionProvider", "CPUExecutionProvider"],
-        )
-        log.info("NPU session on %s", self.sess.get_providers())
-        self.state = None
+    def __init__(self, model_path: str, tokenizer_path: str,
+                 max_seq: int = 2048, prefer_npu: bool = True):
+        from agent.core.onnx_model import OnnxSsmBackend
+        self._b = OnnxSsmBackend(model_path, tokenizer_path,
+                                 max_seq=max_seq, prefer_npu=prefer_npu)
 
     def reset_state(self) -> None:
-        self.state = None
+        self._b.reset_state()
 
     def generate(self, prompt: str, max_tokens: int = 256) -> str:
-        raise NotImplementedError(
-            "Tokenization + decode loop wired in Stage 2 (C++). "
-            "Use scripts/export_adapters.py to produce the merged INT4 graph."
-        )
+        return self._b.generate(prompt, max_tokens)
 
 
 class LlamaCppBackend:
@@ -131,11 +125,14 @@ def pick_backend(cfg) -> LLMBackend:
     want = cfg.model.backend
     npu = cfg.model.npu_model_path
     cpu = cfg.model.cpu_model_path
+    tok = getattr(cfg.model, "tokenizer_path", "")
     if want in ("auto", "npu") and npu:
         try:
-            return OnnxNpuBackend(npu)
+            tp = tok or str(Path(npu).with_name("tokenizer.json"))
+            return OnnxNpuBackend(npu, tp, max_seq=cfg.model.context_budget_tokens,
+                                  prefer_npu=(want != "cpu"))
         except Exception as e:  # noqa: BLE001
-            log.warning("NPU backend unavailable (%s); falling back", e)
+            log.warning("NPU/ONNX backend unavailable (%s); falling back", e)
             if want == "npu":
                 raise
     if want in ("auto", "cpu", "llamacpp") and cpu:
@@ -160,6 +157,17 @@ class SSMModel:
         graph swap). Here we just switch the active graph/version tag."""
         self.adapter_version = Path(path).stem if path else "base"
         log.info("adapter switched: %s", self.adapter_version)
+
+    def reload(self) -> None:
+        """Re-pick the backend from config (e.g. after scripts/export_adapters.py
+        wrote a merged adapter graph and config points at it). Atomic swap."""
+        old = getattr(self.backend, "_b", self.backend)
+        self.backend = pick_backend(self.cfg)
+        try:
+            del old
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("backend reloaded: %s", type(self.backend).__name__)
 
     def think(self, user_msg: str, context: str = "", observations: str = "") -> ModelResult:
         prompt = (

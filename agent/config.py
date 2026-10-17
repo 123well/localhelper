@@ -35,6 +35,7 @@ class ModelConfig:
     # max reasoning/tool-use capability. Shipped as ONNX for the Ryzen AI NPU
     # (amdxdna driver + Vitis AI EP of ONNX Runtime) or GGUF for CPU debug.
     npu_model_path: str = ""       # e.g. data_dir/model/mamba2-7b-int4.onnx
+    tokenizer_path: str = ""       # HF tokenizers JSON (same dir as onnx by default)
     cpu_model_path: str = ""       # e.g. data_dir/model/mamba2-7b-q4.gguf
     max_tokens: int = 512
     temperature: float = 0.3
