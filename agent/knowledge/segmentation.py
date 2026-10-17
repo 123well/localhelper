@@ -99,13 +99,19 @@ def _split_python(content: str, source: str) -> list[Segment]:
 
 
 def _signature(node, lines: list[str]) -> str:
-    dec = ast.unparse(node.decorator_list[0]) if node.decorator_list else None
-    head = lines[node.lineno - 1].strip()
-    if dec:
-        head = f"@{dec}\n{head}"
-    args = ", ".join(getattr(node.args, "args", []) and
-                     [a.arg for a in node.args.args] or [])
-    return head if "->" in head or "(" in head else f"{node.name}({args})"
+    # CRASH FIX: ClassDef has no .args — only FunctionDef/AsyncFunctionDef do.
+    # Studying any file with top-level classes raised AttributeError and killed
+    # the whole study batch (and returned an empty socket reply to `ctl`).
+    try:
+        dec = ast.unparse(node.decorator_list[0]) if node.decorator_list else None
+        head = lines[node.lineno - 1].strip()
+        if dec:
+            head = f"@{dec}\n{head}"
+        a = getattr(node, "args", None)
+        args = ", ".join(x.arg for x in a.args) if a is not None else ""
+        return head if "(" in head else f"{node.name}({args})"
+    except Exception:  # noqa: BLE001  signature is cosmetic — never fatal
+        return getattr(node, "name", "?")
 
 
 def _windows(content: str, source: str, size: int = 600, overlap: int = 80) -> list[Segment]:

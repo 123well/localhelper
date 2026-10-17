@@ -14,6 +14,7 @@ returning a plain dict — JSON-friendly, testable, UI-ready.
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import json
 import logging
 import time
@@ -131,13 +132,29 @@ class ControlMixin:
         the event loop keeps serving user requests — the daemon must never
         freeze because a background job is draining its queue."""
         import asyncio as _aio
+        if name.lower().strip() == "ask":
+            q = (arg or "").strip()
+            if not q:
+                return {"ok": False, "error": "ask <вопрос>"}
+            hits = self.memory.search(q, collections=("docs", "cards"), top_k=3)
+            ctx = "\n---\n".join(h.text[:500] for h in hits)
+            prompt = f"Вопрос: {q}\nКонтекст из базы знаний:\n{ctx}" if ctx else q
+            reply = await self.think_loop(prompt)
+            return {"ok": True, "answer": reply, "sources": len(hits)}
         if name.lower().strip() == "study":
             a = arg.strip()
             if not a.startswith("add") and a not in ("stop", "queue"):
                 if self.study is not None:
+                    # `study run --max N`: ограничить число документов за запуск
+                    mmax = _re.search(r"--max[= ](\d+)", a)
+                    max_docs = int(mmax.group(1)) if mmax else None
+                    force = "--force" in a or "форс" in a
                     budget = float(a) if a.replace(".", "", 1).isdigit() else 20.0
                     self._bg_learning_paused = False
-                    reps = await _aio.to_thread(self.study.run_pending, budget_sec=budget)
+                    # NOTE: pass positionally — to_thread only forwards *args;
+                    # a lambda would be picklable-safe but keyword form broke here.
+                    reps = await _aio.to_thread(self.study.run_pending,
+                                                budget, max_docs, force)
                     return {"ok": True, "processed": len(reps),
                             "queue": self.study.queue.stats()}
         return self.control(name, arg)
@@ -228,9 +245,13 @@ class ControlMixin:
                     return {"ok": True, "study": "paused"}
                 if a == "queue":
                     return {"ok": True, "queue": self.study.queue.stats()}
+                mmax = _re.search(r"--max[= ](\d+)", a)
+                max_docs = int(mmax.group(1)) if mmax else None
+                force = "--force" in a or "форс" in a
                 budget = float(a) if a.replace(".", "", 1).isdigit() else 20.0
                 self._bg_learning_paused = False
-                reps = self.study.run_pending(budget_sec=budget)
+                reps = self.study.run_pending(budget_sec=budget, max_docs=max_docs,
+                                              force=force)
                 return {"ok": True, "processed": len(reps), "queue": self.study.queue.stats()}
             if name == "kb":
                 return self._ctl_kb(arg)
