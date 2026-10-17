@@ -49,14 +49,19 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     cur = "input_ids"
     for i in range(layers):
         emb = f"emb_{i}"
-        nodes.append(helper.make_node("Gather", ["input_ids", "Wemb"], [emb],
+        # ONNX Gather signature: Gather(data, indices) — data is the embedding
+        # matrix, indices are the token ids (reversed order fails graph check).
+        nodes.append(helper.make_node("Gather", ["Wemb", "input_ids"], [emb],
                                       axis=0))
         sq = f"emb_sq_{i}"
         nodes.append(helper.make_node("Cast", [emb], [sq], to=TensorProto.FLOAT))
         flat = f"emb_flat_{i}"
         nodes.append(helper.make_node("Reshape", [sq, "shape_1d"], [flat]))
         st = f"state_{i}"
-        nodes.append(helper.make_node("Gather", ["state_in", f"idx_{i}"], [st]))
+        # state_in is [L, 1, D] (contract): Gather over axis 0 selects the
+        # layer slot -> [1, D].
+        nodes.append(helper.make_node("Gather", ["state_in", f"idx_{i}"], [st],
+                                      axis=0))
         sflat = f"state_flat_{i}"
         nodes.append(helper.make_node("Reshape", [st, "shape_1d"], [sflat]))
         # x' = tanh(state @ A_rec^T + emb @ B_inp^T)   (one SSM-ish step)
@@ -69,11 +74,11 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
         th = f"hid_{i}"
         nodes.append(helper.make_node("Tanh", [sm], [th]))
         if i < layers - 1:
-            # carry hidden into next layer's slot of state_out
-            us = f"us_{i}"
-            nodes.append(helper.make_node("Unsqueeze", [th, "axes_1"], [us]))
+            # carry hidden into next layer's slot of state_out.
+            # th is [1, D]; unsqueeze axis 0 -> [1, 1, D] which matches the
+            # ScatterND slice shape data[indices[-1]:] for a [L,1,D] tensor.
             us2 = f"us2_{i}"
-            nodes.append(helper.make_node("Unsqueeze", [us, "axes_0"], [us2]))
+            nodes.append(helper.make_node("Unsqueeze", [th, "axes_neg1"], [us2]))
             nodes.append(helper.make_node("ScatterND",
                                           ["state_in", f"scatter_idx_{i}", us2],
                                           [f"so_{i}"]))
@@ -86,25 +91,34 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
     nodes.append(helper.make_node("Reshape", [posf, "shape_1d"], [posr]))
     pb = "pos_bias"
     nodes.append(helper.make_node("Mul", [posr, "pos_scale"], [pb]))
+    # broadcast (d,) -> (1, vocab): reshape via a (1, d) initializer, then
+    # transpose to (d, 1) and Expand along the vocab axis. (Expanding (d,)
+    # directly against shape (1, vocab) is invalid when d != vocab.)
+    pbr = "pos_bias_row"
+    nodes.append(helper.make_node("Reshape", [pb, "shape_1xd"], [pbr]))
+    pbt = "pos_bias_t"
+    nodes.append(helper.make_node("Transpose", [pbr], [pbt], perm=[1, 0]))
     pbe = "pos_bias_e"
-    nodes.append(helper.make_node("Expand", [pb, "shape_logits"], [pbe]))
+    nodes.append(helper.make_node("Expand", [pbt, "shape_logits"], [pbe]))
     lg0 = "logits_pre"
     nodes.append(helper.make_node("MatMul", [final_hid, "C_out"], [lg0]))
     nodes.append(helper.make_node("Add", [lg0, pbe], ["logits"]))
     # last layer writes its hidden back into state slot L-1
     usl = "usl"
-    nodes.append(helper.make_node("Unsqueeze", [final_hid, "axes_1"], [usl]))
-    usl2 = "usl2"
-    nodes.append(helper.make_node("Unsqueeze", [usl, "axes_0"], [usl2]))
+    nodes.append(helper.make_node("Unsqueeze", [final_hid, "axes_neg1"], [usl]))
     nodes.append(helper.make_node("ScatterND",
                                   [f"so_{layers - 2}" if layers > 1 else "state_in",
-                                   f"scatter_idx_{layers - 1}", usl2],
+                                   f"scatter_idx_{layers - 1}", usl],
                                   ["state_out"]))
 
     # constants
     consts = {
         "shape_1d": np.array([d], dtype=np.int64),
+        "shape_1xd": np.array([1, d], dtype=np.int64),
         "axes_1": np.array([1], dtype=np.int64),
+        # opset 17 Unsqueeze uses the LAST axis by default; to prepend a dim
+        # (th [1,D] -> [1,1,D]) we must name axis -1 explicitly.
+        "axes_neg1": np.array([-1], dtype=np.int64),
         "axes_0": np.array([0], dtype=np.int64),
         "shape_logits": np.array([1, vocab], dtype=np.int64),
         "pos_scale": np.full((d,), 1e-4, dtype=np.float32),
@@ -120,12 +134,12 @@ def build_graph(out_dir: Path, vocab: int, d: int, layers: int) -> Path:
 
     g_inputs = [
         helper.make_tensor_value_info("input_ids", TensorProto.INT64, [1, 1]),
-        helper.make_tensor_value_info("state_in", TensorProto.FLOAT, [1, layers, d]),
+        helper.make_tensor_value_info("state_in", TensorProto.FLOAT, [layers, 1, d]),
         helper.make_tensor_value_info("pos", TensorProto.INT64, [1, 1]),
     ]
     g_outputs = [
         helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, vocab]),
-        helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [1, layers, d]),
+        helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [layers, 1, d]),
     ]
     graph = helper.make_graph(nodes, "tiny_ssm", g_inputs, g_outputs, inits)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)],

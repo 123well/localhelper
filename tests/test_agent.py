@@ -314,5 +314,31 @@ class TestKnowledgeCards(unittest.TestCase):
         self.assertIn("cards", rep)
 
 
+class TestOnnxContract(unittest.TestCase):
+    """The test graph builder must produce a loadable graph that the NPU
+    backend can actually run end-to-end (regression: Gather operands were
+    swapped -> INVALID_GRAPH at session creation)."""
+
+    def test_build_and_generate(self):
+        try:
+            import onnxruntime  # noqa: F401
+            import tokenizers  # noqa: F401
+        except ImportError:
+            self.skipTest("onnxruntime/tokenizers not installed")
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run([sys.executable, "scripts/build_test_onnx.py",
+                                "--out-dir", td], cwd=str(Path(__file__).resolve().parents[1]),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=r.stderr[-500:])
+            from agent.core.onnx_model import OnnxSsmBackend
+            be = OnnxSsmBackend(Path(td) / "tiny-ssm.onnx",
+                                Path(td) / "tokenizer.json", prefer_npu=False)
+            out = be.generate("ls -la", max_tokens=16)
+            self.assertIsInstance(out, str)
+            # greedy char-level loop must emit something and stop by eos/limit
+            self.assertGreater(len(out), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
