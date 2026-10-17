@@ -42,7 +42,23 @@ class TestTypoAnalyzer(unittest.TestCase):
 
     def test_real_command_not_flagged(self):
         self.assertEqual(self.an.analyze_line("git status", self.lex), [])
-        self.assertEqual(self.an.analyze_line("ls -la ~/projects", self.lex), [])
+
+    def test_ls_new_home_dir_not_flagged(self):
+        # 'ls -la ~/projects' on a machine WITHOUT ~/projects must not be
+        # flagged as a typo of some unrelated existing dir (fs-verified-only;
+        # regression for the projects->Documents false positive).  Uses the
+        # KDE_AGENT_HOME override so the result is deterministic.
+        from agent.core.typo_model import Lexicon, ProposalEngine, MockModelAnalyzer
+        from agent.core.initiative import KNOWN_CMDS
+        fake = Path(tempfile.mkdtemp(prefix="kde-agent-home-"))
+        (fake / "Documents").mkdir()
+        os.environ["KDE_AGENT_HOME"] = str(fake)
+        try:
+            lex = Lexicon(None)
+            an = MockModelAnalyzer(ProposalEngine(set(KNOWN_CMDS)))
+            self.assertEqual(an.analyze_line("ls -la ~/projects", lex), [])
+        finally:
+            os.environ.pop("KDE_AGENT_HOME", None)
 
     def test_path_typo_with_existing_sibling(self):
         home = Path.home()
@@ -57,6 +73,47 @@ class TestTypoAnalyzer(unittest.TestCase):
         # brand-new filename inside an existing dir is normal usage
         v = self.an.analyze_line("touch ~/brand_new_file_xyz.txt", self.lex)
         self.assertEqual([x for x in v if x.kind == "path_segment"], [])
+
+
+class TestPathFalsePositives(unittest.TestCase):
+    """Regressions for the fs-verified-only rule: personal history and fuzzy
+    distances must NEVER outweigh live filesystem state (0550d85)."""
+
+    def setUp(self):
+        from agent.core.typo_model import Lexicon, ProposalEngine, MockModelAnalyzer
+        from agent.core.initiative import KNOWN_CMDS
+        self.fake_home = Path(tempfile.mkdtemp(prefix="kde-agent-home-"))
+        (self.fake_home / "Documents").mkdir()
+        os.environ["KDE_AGENT_HOME"] = str(self.fake_home)
+        self.lex = Lexicon(None)
+        self.an = MockModelAnalyzer(ProposalEngine(set(KNOWN_CMDS)))
+
+    def tearDown(self):
+        os.environ.pop("KDE_AGENT_HOME", None)
+
+    def _flagged_paths(self, line: str):
+        return [x for x in self.an.analyze_line(line, self.lex)
+                if x.kind == "path_segment"]
+
+    def test_learned_dict_cannot_invent_path_targets(self):
+        # user habitually types 'documnets' AND has a real ~/projects dir:
+        # neither history nor a close dictionary word may legitimize flagging
+        # '~/projects' as a typo of 'Documents' — projects exists on disk.
+        for _ in range(6):
+            self.lex.observe("cd ~/documnets")
+        self.assertEqual(self._flagged_paths("cd ~/projects"), [])
+
+    def test_true_typo_still_flagged_in_fake_home(self):
+        # 'Documnts' does not exist; verified sibling 'Documents' does -> flag
+        v = self._flagged_paths("cd ~/Documnts")
+        self.assertTrue(v, "expected fs-verified suggestion for ~/Documnts")
+        self.assertTrue(v[0].intended.endswith("/Documents"))
+
+    def test_new_directory_not_a_typo_even_if_close_to_history(self):
+        # fresh ~/projcts (distance 1 from observed 'projects') but nothing
+        # named that closely exists under HOME -> abstain, don't nag.
+        self.lex.observe("cd ~/projects")
+        self.assertEqual(self._flagged_paths("cd ~/projcts"), [])
 
 
 class TestSafety(unittest.TestCase):
@@ -198,6 +255,89 @@ class TestSleepTrainer(unittest.TestCase):
 def np_allclose(a, b):
     import numpy as np
     return bool(np.allclose(a, b))
+
+
+class TestKnowledgeCards(unittest.TestCase):
+    """CardStore regressions: reserved-word columns (keep/drop), dedup tiers,
+    conflict review flow ('program proposes — user decides')."""
+
+    def setUp(self):
+        self.tmp = _fresh_env()
+        from agent.memory.rag import Memory
+        from agent.knowledge.cards import CardStore
+        self.m = Memory(self.tmp / "mem.db", dim=128)
+        self.cs = CardStore(self.m)
+
+    def tearDown(self):
+        self.m.close()
+
+    def test_add_get_roundtrip(self):
+        c = self.cs.add("api", "systemd-run transient units",
+                        "systemd-run --user --unit=X cmd runs X in a transient unit.",
+                        examples=["systemd-run --user --unit=bak restic backup"],
+                        phrases=["transient unit"])
+        g = self.cs.get(c.id)
+        self.assertIsNotNone(g)
+        self.assertEqual(g.type, "api")
+        self.assertIn("bak", g.examples[0])
+
+    def test_near_duplicate_merges_bumps_version(self):
+        c1 = self.cs.add("concept", "git rebase interactive",
+                         "git rebase -i HEAD~3 lets you squash, edit and reorder commits.")
+        c2 = self.cs.add("concept", "git rebase interactive",
+                         "git rebase -i HEAD~3 lets you squash, edit and reorder commits.")
+        self.assertEqual(c1.id, c2.id)          # merged, not duplicated
+        self.assertGreaterEqual(c2.version, 2)
+
+    def test_conflict_recorded_and_resolved(self):
+        # regression for sqlite 'near "drop": syntax error' — keep/drop are
+        # reserved words and must be quoted in every statement.
+        base = ("journalctl -u myservice -b shows current-boot logs "
+                "for a systemd unit since boot")
+        self.cs.add("command", "journalctl basic usage", base)
+        c2 = self.cs.add("command", "journalctl boot logs",
+                         base.replace("for a systemd unit since boot",
+                                      "for the systemd unit since boot"))
+        pend = self.cs.pending_conflicts()
+        self.assertTrue(pend, "expected a pending conflict row")
+        dropped_id = pend[0][1]
+        self.cs.resolve_conflict(c2.id, dropped_id)   # human decides: keep new
+        self.assertEqual(self.cs.pending_conflicts(), [])
+        self.assertIsNone(self.cs.get(dropped_id))
+
+    def test_search_and_quality_report(self):
+        self.cs.add("command", "journalctl usage",
+                    "journalctl -u <service> -b shows current-boot logs for a unit.")
+        found = self.cs.search("journalctl service logs", top_k=3)
+        self.assertTrue(found)
+        rep = self.cs.quality_report()
+        self.assertIn("cards", rep)
+
+
+class TestOnnxContract(unittest.TestCase):
+    """The test graph builder must produce a loadable graph that the NPU
+    backend can actually run end-to-end (regression: Gather operands were
+    swapped -> INVALID_GRAPH at session creation)."""
+
+    def test_build_and_generate(self):
+        try:
+            import onnxruntime  # noqa: F401
+            import tokenizers  # noqa: F401
+        except ImportError:
+            self.skipTest("onnxruntime/tokenizers not installed")
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run([sys.executable, "scripts/build_test_onnx.py",
+                                "--out-dir", td], cwd=str(Path(__file__).resolve().parents[1]),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=r.stderr[-500:])
+            from agent.core.onnx_model import OnnxSsmBackend
+            be = OnnxSsmBackend(Path(td) / "tiny-ssm.onnx",
+                                Path(td) / "tokenizer.json", prefer_npu=False)
+            out = be.generate("ls -la", max_tokens=16)
+            self.assertIsInstance(out, str)
+            # greedy char-level loop must emit something and stop by eos/limit
+            self.assertGreater(len(out), 0)
 
 
 if __name__ == "__main__":

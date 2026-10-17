@@ -17,9 +17,12 @@ CMD_TIMEOUT = 30
 
 
 class ToolRegistry:
-    def __init__(self, cfg, memory, safety, bridge):
+    def __init__(self, cfg, memory, safety, bridge, cards=None):
         self.cfg, self.memory, self.safety, self.bridge = cfg, memory, safety, bridge
+        self.cards = cards          # CardStore | None (knowledge subsystem)
         self.last_undo: tuple | None = None
+        # Code assistant registers text-edit undo entries here (kind "edit").
+        self._undo_edits: list[tuple] = []
         self._term_history: list[tuple[str, str]] = []
         self._tools = {
             "exec_command": self.exec_command,
@@ -37,6 +40,7 @@ class ToolRegistry:
             "confirm_dialog": self.confirm_dialog,
             "rag_search": self.rag_search,
             "memory_search": self.memory_search,
+            "card_search": self.card_search,
             "set_reminder": self.set_reminder,
             "dbus_call": self.dbus_call,
             "update_widget": self.update_widget,
@@ -176,6 +180,28 @@ class ToolRegistry:
         return "\n".join(f"({h.collection}/{h.meta.get('kind','')}) [{h.score:.2f}] {h.text[:200]}"
                          for h in hits) or "NO_RESULTS"
 
+    def card_search(self, query: str, types: list[str] | None = None,
+                    top_k: int = 4) -> str:
+        """Knowledge-card retrieval with source attribution (spec: режим
+        объяснения источника — each hit carries its provenance)."""
+        cards = self.cards
+        if cards is None:
+            return "DISABLED: подсистема знаний выключена (knowledge.enabled=false)."
+        found = cards.search(query, top_k=top_k,
+                             types=tuple(types) if types else None)
+        if not found:
+            return "NO_CARDS: карточек по запросу нет — предложите пользователю источник (/index <dir>) или задайте вопрос напрямую."
+        out = []
+        for c in found:
+            src = c.meta.get("source", "?")
+            lines = c.meta.get("lines", [0, 0])
+            out.append(f"#{c.id} v{c.version} [{c.type}] {c.summary}\n"
+                       f"{c.body[:500]}\n"
+                       f"(источник: {src}:{lines[0]}-{lines[1]}, "
+                       f"value={c.value:.2f}, use={c.usages})")
+            cards.record_usage(c.id)   # retrieval counts as a usage signal
+        return "\n---\n".join(out)
+
     def set_reminder(self, text: str, minutes: int = 10) -> str:
         self.memory.add("reminders", text, "reminder", {"due": time.time() + minutes * 60})
         return f"OK: напоминание через {minutes} мин: {text}"
@@ -206,7 +232,28 @@ class ToolRegistry:
         self.bridge.notify("KDE Agent", f"Могу автоматизировать: {pattern[:80]}")
         return "OK: предложение автоматизации отправлено"
 
+    def register_edit_undo(self, entry: tuple) -> None:
+        """Undo sink for the code assistant: ('edit', path, old_content|None)."""
+        if isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "edit":
+            self._undo_edits.append(entry)
+
     def undo_last(self) -> str:
+        # text edits from the code assistant take precedence (LIFO), then the
+        # shell-op snapshot journal (rm/mv backups) from SafetyGate
+        while self._undo_edits:
+            _, path, old = self._undo_edits.pop()
+            target = Path(path)
+            try:
+                if old is None:
+                    if target.exists():
+                        target.unlink()
+                    return f"отменено: {path} удалён (был создан агентом)"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(old)
+                self.memory.episode("undo", f"restored {path}", value=1.2)
+                return f"отменено: содержимое {path} восстановлено"
+            except OSError as e:
+                return f"ОТМЕНА НЕ УДАЛАСЬ: {e}"
         if not self.last_undo:
             return "Нечего отменять"
         snap, backup = self.last_undo

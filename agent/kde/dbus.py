@@ -14,6 +14,7 @@ import json
 import logging
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger("kde-agent.kde")
@@ -140,6 +141,19 @@ class KDEBridge:
         if r.returncode == 0 and r.stdout.strip().isdigit():
             return int(r.stdout.strip()) / 1000.0
         return 0.0
+
+    # ---------- power (energy gate input; cheap sysfs poll, no D-Bus needed) --
+    def on_battery(self) -> bool:
+        """UPower-free fallback: read /sys/class/power_supply. True only when a
+        battery exists AND is discharging. Headless/dev machines -> False."""
+        try:
+            for ps in Path("/sys/class/power_supply").glob("BAT*"):
+                status = (ps / "status").read_text().strip().lower()
+                if status == "discharging":
+                    return True
+        except OSError:
+            pass
+        return False
 
     # ---------- KDE Wallet ---------------------------------------------------
     def wallet_store(self, key: str, value: str, folder: str = "kde-agent") -> bool:

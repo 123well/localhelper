@@ -7,6 +7,7 @@ is fetched only when the model explicitly asks via a tool.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -36,7 +37,17 @@ class Agent:
         self.memory = Memory(self.cfg.db_path, self.cfg.rag.dim)
         self.bridge = KDEBridge()
         self.safety = SafetyGate(self.cfg.safety)
-        self.tools = ToolRegistry(self.cfg, self.memory, self.safety, self.bridge)
+        # --- knowledge subsystem: cards wired early (tools use them); the
+        # study pipeline is wired after the event bus exists (idle gate input).
+        # Whole subsystem is config-switchable (knowledge.enabled=false -> off).
+        self.cards = None
+        self.study = None
+        if self.cfg.knowledge.enabled:
+            from agent.knowledge.cards import CardStore
+            self.cards = CardStore(self.memory, self.cfg.knowledge.dedup_high,
+                                   self.cfg.knowledge.dedup_low)
+        self.tools = ToolRegistry(self.cfg, self.memory, self.safety, self.bridge,
+                                  cards=self.cards)
         self.model = SSMModel(self.cfg)
         self.ctx = ContextManager(budget_tokens=self.cfg.model.context_budget_tokens)
         # Typo judgement belongs to the model analyzer, not to string matching.
@@ -54,28 +65,45 @@ class Agent:
         self.initiative.configure_safety(self.cfg.safety)
         self.trainer = AdapterTrainer(self.cfg, self.memory, self.memory.embedder,
                                       self.cfg.adapters_dir)
+        # --- code assistant (diff + self-check ladder), config-switchable
+        self.code = None
+        if self.cfg.code_assist.enabled:
+            from agent.tools.code_assist import CodeAssistant
+            self.code = CodeAssistant(self.cfg, self.memory, self.safety,
+                                      self.bridge, self.cfg.code_assist.gates)
+            # /undo must be able to roll back applied diffs (text restore)
+            self.code.undo_sink = self.tools.register_edit_undo
         self.bus = EventBus()
+        if self.cards is not None:
+            from agent.knowledge.pipeline import EnergyGate, StudyPipeline, StudyQueue
+            queue = StudyQueue(self.cfg.data_dir / "study_queue.db")
+            gate = EnergyGate(on_battery=self.bridge.on_battery,
+                              idle_sec=self.bridge.idle_seconds)
+            self.study = StudyPipeline(self.cards, queue, gate,
+                                       max_segments_per_source=self.cfg.knowledge.max_segments_per_source)
         self.running = False
 
     def _setup_logging(self) -> None:
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         root = logging.getLogger()
-        root.setLevel(getattr(logging, self.cfg.log_level.upper(), logging.INFO))
-        # idempotent: tests may build many agents in one process; basicConfig
-        # would otherwise leak handlers and leave an unclosed log file fd
+        # Idempotent: re-running setup (tests, reloads) must not stack
+        # handlers — every extra FileHandler keeps a duplicate log file
+        # open (ResourceWarning) and multiplies every log line.
         for h in list(root.handlers):
-            root.removeHandler(h)
-            try:
-                h.close()
-            except Exception:  # noqa: BLE001
-                pass
-        fmt = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
-        fh = logging.FileHandler(self.cfg.log_path)
-        fh.setFormatter(fmt)
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        root.addHandler(fh)
-        root.addHandler(sh)
+            if getattr(h, "_kde_agent", False):
+                root.removeHandler(h)
+                try:
+                    h.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        handlers = [logging.FileHandler(self.cfg.log_path),
+                    logging.StreamHandler()]
+        for h in handlers:
+            h._kde_agent = True      # our handler tag (see above)
+        logging.basicConfig(
+            level=getattr(logging, self.cfg.log_level.upper(), logging.INFO),
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+            handlers=handlers)
 
     # ---------------- wiring ----------------
     def subscribe(self) -> None:
@@ -171,8 +199,32 @@ class Agent:
         elif cmd == "/sleep":
             print("запуск цикла сна…", self.trainer.sleep_cycle())
         elif cmd == "/index":
-            n = index_docs(self.memory, arg or str(Path.cwd()))
-            print(f"проиндексировано фрагментов: {n}")
+            if self.study is not None:
+                n = self.study.ingest_dir(arg or str(Path.cwd()),
+                                          priority=self.cfg.knowledge.study_priority_default)
+                print(f"в очередь изучения поставлено файлов: {n} "
+                      f"(обработка — по энергогейту, см. /study)")
+            else:
+                n = index_docs(self.memory, arg or str(Path.cwd()))
+                print(f"проиндексировано фрагментов: {n}")
+        elif cmd == "/study":
+            if self.study is None:
+                print("подсистема знаний отключена (knowledge.enabled=false)")
+            elif arg.startswith("cards"):
+                for c in self.cards.list_cards(limit=30):
+                    print(f"#{c.id} v{c.version} [{c.type}] {c.summary[:70]} "
+                          f"value={c.value:.2f} use={c.usages}/{c.helpful}/{c.not_helpful}")
+            elif arg.startswith("conflicts"):
+                for card, other in self.cards.pending_conflicts():
+                    print(f"конфликт: #{card.id} «{card.summary[:50]}» vs #{other}")
+            elif arg.startswith("resolve") and len(arg.split()) == 3:
+                _, keep, drop = arg.split()
+                self.cards.resolve_conflict(int(keep), int(drop))
+                print(f"конфликт решён: оставлен #{keep}")
+            else:
+                reps = self.study.run_pending(budget_sec=15)
+                print(json.dumps([r for r in reps] or {"queued": self.study.queue.stats()},
+                                 ensure_ascii=False)[:800])
         elif cmd == "/tools":
             print(", ".join(self.tools.names()))
         elif cmd == "/state":
@@ -199,6 +251,14 @@ class Agent:
                 if "saved" in report:
                     self.model.load_adapter(str(self.trainer.active_path))
                     log.info("night adapter activated: %s", report["saved"])
+            # background study shares the same quiet windows (energy-gated)
+            if self.study is not None and (idle > 60 or hhmm >= self.cfg.sleep.nightly_start):
+                try:
+                    done = self.study.run_pending(budget_sec=30)
+                    if done:
+                        log.info("study batch: %d sources", len(done))
+                except Exception:  # noqa: BLE001
+                    log.exception("study batch failed (non-fatal)")
 
 
 def index_docs(memory: Memory, root: str | Path, chunk: int = 1200,
