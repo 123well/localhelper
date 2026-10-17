@@ -30,7 +30,12 @@ log = logging.getLogger("kde-agent")
 class Agent(ControlMixin):
     MAX_STEPS = 4   # bounded ReAct loop per request (energy cap)
 
-    def __init__(self, cfg: AgentConfig | None = None):
+    def __init__(self, cfg: AgentConfig | None = None, interactive: bool = False):
+        # interactive=True ONLY for `kde-agent run` (foreground debug REPL).
+        # The daemon must never attach to fd 0: under systemd/nohup/& stdin is
+        # /dev/null or a supervisor pipe; EOF there produced an internal
+        # asyncio transport callback that killed the whole daemon at startup.
+        self.interactive = interactive
         self.cfg = cfg or AgentConfig.load()
         self.cfg.ensure_dirs()
         self._setup_logging()
@@ -150,14 +155,21 @@ class Agent(ControlMixin):
         await self.bridge.connect()
         self.subscribe()
         self.tools.update_widget("online")
-        tasks = [asyncio.create_task(c, name=n) for c, n in (
-            (StdinSource(self.bus).run(), "stdin"),
+        source_specs = [
             (ShellSocketSource(self.bus).run(), "shell-socket"),
             (IdleWatcher(self.bus, self.bridge,
                          self.cfg.initiative.idle_help_after_sec).run(), "idle"),
             (self.bus.run(), "event-bus"),
-            (self.night_scheduler(), "night-scheduler"),
-            (self.startup_study_burst(), "startup-study"))]
+            (self.night_scheduler(), "night-scheduler")]
+        if self.interactive:
+            # foreground debug REPL only — daemon never touches fd 0
+            source_specs.insert(0, (StdinSource(self.bus).run(), "stdin"))
+        tasks = [asyncio.create_task(c, name=n) for c, n in source_specs]
+        # Finite jobs (startup study burst) must NOT live in the wait set:
+        # asyncio.wait(FIRST_COMPLETED) treats normal completion like a crash
+        # and tears the daemon down. Run them as independent background tasks.
+        self._aux_tasks = [asyncio.create_task(self.startup_study_burst(),
+                                               name="startup-study")]
         # control socket task (created by the daemon entrypoint) is awaited
         # too — see cli._daemon_main; here we only own our source tasks.
         log.info("kde-agent up; data=%s", self.cfg.data_dir)
@@ -224,6 +236,11 @@ class Agent(ControlMixin):
                     fn()
             except Exception:  # noqa: BLE001
                 pass
+        # cancel independent background jobs (startup burst etc.) so shutdown
+        # never leaves orphan asyncio tasks behind (spec: no unfinished bg work)
+        for t in getattr(self, "_aux_tasks", []):
+            if not t.done():
+                t.cancel()
         try:
             self.memory.close()
         except Exception:  # noqa: BLE001

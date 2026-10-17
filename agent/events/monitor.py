@@ -61,43 +61,62 @@ class EventBus:
 
 
 class StdinSource:
-    """Terminal interface: lines become user_request events."""
+    """Terminal interface: lines become user_request events.
 
-    def __init__(self, bus: EventBus):
+    IMPORTANT (daemon-first spec): this source must ONLY be active for the
+    interactive `run` command. In background mode (`daemon`, systemd unit,
+    nohup) stdin is /dev/null or a pipe owned by the supervisor shell; when
+    that fd hits EOF, asyncio's pipe reader schedules its close-callback on
+    the still-open transport. That internal callback raises ConnectionReset-
+    Error *outside* any try/except we can place, and because StdinSource.run
+    was awaited via asyncio.wait(FIRST_COMPLETED), the finished task killed
+    the whole daemon right after startup (observed in production logs).
+    Interactive mode passes an explicit open stream instead of fd 0.
+    """
+
+    def __init__(self, bus: EventBus, stream=None):
         self.bus = bus
+        self.stream = stream          # None => sys.stdin (interactive only)
+
+    @staticmethod
+    def _is_devnull(f) -> bool:
+        import os as _os
+        try:
+            return _os.stat(f.fileno()).st_rdev == _os.stat(_os.devnull).st_rdev
+        except (OSError, ValueError):
+            return False
 
     async def run(self) -> None:
-        import os as _os
         import sys
-        # /dev/null stdin (systemd service, `daemon < /dev/null`): nothing to
-        # watch. Connecting anyway makes asyncio register fd 0 with epoll and
-        # then crash in an *internal* callback (KeyError '0 is not registered'
-        # / PermissionError) that our try/except cannot even see.
-        try:
-            if _os.stat(sys.stdin.fileno()).st_rdev == \
-                    _os.stat(_os.devnull).st_rdev:
-                log.info("stdin is /dev/null; terminal source disabled")
-                return
-        except (OSError, ValueError):
-            pass
+        stream = self.stream if self.stream is not None else sys.stdin
+        if self._is_devnull(stream):
+            log.info("stdin is /dev/null; terminal source disabled")
+            return
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         try:
-            protocol = asyncio.StreamReaderProtocol(reader)
-            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+            transport, _ = await loop.connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), stream)
         except (OSError, ValueError, PermissionError):        # not a tty (tests)
             return
-        while True:
-            raw = await reader.readline()
-            if not raw:
-                # EOF (daemon under systemd: stdin closed) — exit quietly.
-                # The old `continue` spun a busy-loop forever (energy bug).
-                log.info("stdin closed; terminal source stopped")
-                return
-            line = raw.decode(errors="replace").strip()
-            if not line:
-                continue
-            self.bus.emit("user_request", text=line)
+        try:
+            while True:
+                raw = await reader.readline()
+                if not raw:
+                    # EOF: stop quietly AND tear the pipe transport down here,
+                    # so no internal "pipe closed" callback can fire later
+                    # outside our exception handling (see class docstring).
+                    log.info("stdin closed; terminal source stopped")
+                    return
+                line = raw.decode(errors="replace").strip()
+                if not line:
+                    continue
+                self.bus.emit("user_request", text=line)
+        finally:
+            try:
+                transport.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class ShellSocketSource:
