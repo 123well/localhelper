@@ -37,7 +37,9 @@ class Agent:
         self.memory = Memory(self.cfg.db_path, self.cfg.rag.dim)
         self.bridge = KDEBridge()
         self.safety = SafetyGate(self.cfg.safety)
-        # --- knowledge subsystem (cards / background study), config-switchable
+        # --- knowledge subsystem: cards wired early (tools use them); the
+        # study pipeline is wired after the event bus exists (idle gate input).
+        # Whole subsystem is config-switchable (knowledge.enabled=false -> off).
         self.cards = None
         self.study = None
         if self.cfg.knowledge.enabled:
@@ -63,20 +65,14 @@ class Agent:
         self.initiative.configure_safety(self.cfg.safety)
         self.trainer = AdapterTrainer(self.cfg, self.memory, self.memory.embedder,
                                       self.cfg.adapters_dir)
-        # --- knowledge subsystem: cards wired early (tools use them), study
-        # pipeline wired after the event bus exists (idle gate input).
-        self.cards = None
-        self.study = None
-        if self.cfg.knowledge.enabled:
-            from agent.knowledge.cards import CardStore
-            self.cards = CardStore(self.memory, self.cfg.knowledge.dedup_high,
-                                   self.cfg.knowledge.dedup_low)
         # --- code assistant (diff + self-check ladder), config-switchable
         self.code = None
         if self.cfg.code_assist.enabled:
             from agent.tools.code_assist import CodeAssistant
             self.code = CodeAssistant(self.cfg, self.memory, self.safety,
                                       self.bridge, self.cfg.code_assist.gates)
+            # /undo must be able to roll back applied diffs (text restore)
+            self.code.undo_sink = self.tools.register_edit_undo
         self.bus = EventBus()
         if self.cards is not None:
             from agent.knowledge.pipeline import EnergyGate, StudyPipeline, StudyQueue

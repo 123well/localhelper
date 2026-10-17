@@ -113,7 +113,8 @@ class Memory:
             self._vecs = np.stack([_vec(r[4]) for r in rows]) if rows else np.zeros((0, self.embedder.dim), np.float32)
         return self._cache
 
-    def search(self, query: str, collections: tuple[str, ...] = ("docs", "episodes", "prefs"),
+    def search(self, query: str,
+               collections: tuple[str, ...] = ("docs", "episodes", "prefs", "cards"),
                top_k: int = 5, min_value: float = 0.0) -> list[Hit]:
         hits = self._all()
         if not hits:

@@ -262,8 +262,10 @@ class ProposalEngine:
         contain a close EXISTING name => propose it. New-file names at the end
         of an existing directory are normal (touch foo.txt) -> no proposal."""
         expanded = p
+        tilde_home: str | None = None
         if expanded.startswith("~"):
-            expanded = str(_home_dir()) + expanded[1:]
+            tilde_home = str(_home_dir())
+            expanded = tilde_home + expanded[1:]
         expanded = os.path.expanduser(expanded)
         if Path(expanded).exists():
             return None
@@ -287,6 +289,13 @@ class ProposalEngine:
             return None               # every prefix exists -> brand-new file: fine
         seg = parts[bad_idx]
         parent = Path(acc) if acc else Path.cwd()
+        # A '~'-rooted path whose FIRST segment does not exist describes a
+        # brand-new top-level item (~/projects, ~/new-thing). Per the invariant
+        # "new filesystem items are NOT typos", only deeper segments of an
+        # already-existing home subdir may be flagged — and then only with
+        # verified on-disk evidence (siblings below).
+        if tilde_home is not None and bad_idx == 1:
+            return None
         siblings: set[str] = set()
         try:
             siblings = {e.name for e in parent.iterdir()}
