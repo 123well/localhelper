@@ -1,0 +1,216 @@
+diff --git a/agent/core/typo_model.py b/agent/core/typo_model.py
+index f66ceac..1ff4040 100644
+--- a/agent/core/typo_model.py
++++ b/agent/core/typo_model.py
+@@ -28,6 +28,7 @@ import json
+ import os
+ import re
+ import shutil
++import time
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ 
+@@ -150,6 +151,25 @@ class Lexicon:
+     def __init__(self, memory=None):
+         self.memory = memory
+         self.user_words: dict[str, int] = {}   # token -> observed count
++        self._home_names: set[str] = set()     # lazy live scan of HOME entries
++        self._home_scan_ts: float = 0.0        # last refresh time (5 s budget)
++
++    def home_dir_names(self) -> set[str]:
++        """Live (cheap, throttled) listing of names under $HOME. Used by the
++        proposal engine to verify that a learned-dict path candidate actually
++        exists on disk before it may be proposed — history alone is not proof."""
++        now = time.monotonic()
++        if now - self._home_scan_ts >= 5.0:
++            self._home_scan_ts = now
++            try:
++                self._home_names = {p.name for p in _home_dir().iterdir()}
++            except OSError:
++                pass
++        return self._home_names
++
++    def home_name_exists(self, name: str) -> bool:
++        low = name.lower()
++        return any(n.lower() == low for n in self.home_dir_names())
+ 
+     def observe(self, line: str) -> None:
+         for tok in re.findall(r"[\w][\w._-]{1,}", line):
+@@ -228,12 +248,23 @@ class ProposalEngine:
+         out.sort(key=lambda c: c.evidence["rel"])
+         return out[:6]
+ 
++    # ---- live HOME verification helpers --------------------------------------
++    def _home_names(self, lex: Lexicon) -> set[str]:
++        """Names under HOME (throttled lazy scan owned by the Lexicon)."""
++        return lex.home_dir_names()
++
++    def _home_name_exists(self, lex: Lexicon, name: str) -> bool:
++        return lex.home_name_exists(name)
++
+     # ---- paths ---------------------------------------------------------------
+     def check_path(self, p: str, lex: Lexicon) -> tuple[str, list[Candidate]] | None:
+         """Walk segments; first non-existent segment whose siblings/dictionary
+         contain a close EXISTING name => propose it. New-file names at the end
+         of an existing directory are normal (touch foo.txt) -> no proposal."""
+-        expanded = os.path.expanduser(p)
++        expanded = p
++        if expanded.startswith("~"):
++            expanded = str(_home_dir()) + expanded[1:]
++        expanded = os.path.expanduser(expanded)
+         if Path(expanded).exists():
+             return None
+         # walk the path with '~' already resolved; a literal '~' segment would
+@@ -267,24 +298,46 @@ class ProposalEngine:
+             if s.lower() == low:
+                 continue
+             wd = weighted_distance(low, s.lower())
+-            if wd <= max(2.0, len(low) * 0.55):
++            # same acceptance gate as the invariant for paths:
++            # wdist <= max(2, len*0.55) AND char_jaccard >= 0.5 — without the
++            # jaccard floor unrelated sibling names (Documents vs projects)
++            # slip through on long segments and create false positives
++            if wd <= max(2.0, len(low) * 0.55) and char_jaccard(low, s.lower()) >= 0.5:
+                 # target_exists: verified live fact — the sibling is present on
+                 # disk right now (checked again at judgement time below)
+                 cands.append(Candidate(s, "path_segment", "filesystem",
+                                        {"wdist": round(wd, 2),
+                                         "rel": round(wd / max(1, len(low)), 3),
+                                         "target_exists": True}))
++        # learned-dict candidates must be VERIFIED against the live filesystem:
++        # a personal token only qualifies if a name that close actually exists
++        # under the verified prefix (siblings above) or somewhere under HOME
++        # (lazy scan, refreshed at most once per 5 s). Otherwise a brand-new
++        # directory like ~/projects would look like a typo of ~/Documents.
++        home_names = self._home_names(lex)
+         for v, freq in lex.user_words.items():
+             if v == low or v in siblings:
+                 continue
+             wd = weighted_distance(low, v)
+-            if wd <= 2.0:
+-                cands.append(Candidate(v, "path_segment", "learned_dict",
+-                                       {"wdist": round(wd, 2), "freq": freq,
+-                                        "rel": round(wd / max(1, len(low)), 3)}))
++            if wd > max(2.0, len(low) * 0.55):
++                continue
++            if char_jaccard(low, v) < 0.5:
++                continue
++            exists_near = any(
++                Path(acc, cand).exists()
++                for cand in home_names
++                if weighted_distance(low, cand.lower()) <= max(2.0, len(low) * 0.55)
++                and char_jaccard(low, cand.lower()) >= 0.5
++            )
++            if not exists_near:
++                continue
++            cands.append(Candidate(v, "path_segment", "learned_dict",
++                                   {"wdist": round(wd, 2), "freq": freq,
++                                    "rel": round(wd / max(1, len(low)), 3),
++                                    "target_exists": exists_near}))
+         dec = layout_switch_rev(seg)
+         if dec != seg and (dec.lower() in {s.lower() for s in siblings}
+-                           or lex.known(dec)):
++                           or self._home_name_exists(lex, dec)):
+             cands.append(Candidate(dec, "path_segment", "layout",
+                                    {"decoded": True, "wdist": 0.0, "rel": 0.0}))
+         if not cands:
+@@ -296,6 +349,15 @@ class ProposalEngine:
+ PATH_RE = re.compile(r"(?:~?/|\./)[\w.@+\-/]*")
+ 
+ 
++def _home_dir() -> Path:
++    """HOME used for live verification — overridable via KDE_AGENT_HOME so
++    tests can point it at a fake home directory."""
++    return Path(os.environ.get("KDE_AGENT_HOME") or str(Path.home()))
++
++
++# (helpers attached to ProposalEngine below)
++
++
+ class ModelTypoAnalyzer:
+     """Interface: judge typos in one user line. Returns verdicts that already
+     ARE model judgements (confidence + reason), not raw string matches."""
+diff --git a/agent/main.py b/agent/main.py
+index a1a6548..7a32078 100644
+--- a/agent/main.py
++++ b/agent/main.py
+@@ -59,11 +59,25 @@ class Agent:
+ 
+     def _setup_logging(self) -> None:
+         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
++        root = logging.getLogger()
++        # Idempotent: re-running setup (tests, reloads) must not stack
++        # handlers — every extra FileHandler keeps a duplicate log file
++        # open (ResourceWarning) and multiplies every log line.
++        for h in list(root.handlers):
++            if getattr(h, "_kde_agent", False):
++                root.removeHandler(h)
++                try:
++                    h.close()
++                except Exception:  # noqa: BLE001
++                    pass
++        handlers = [logging.FileHandler(self.cfg.log_path),
++                    logging.StreamHandler()]
++        for h in handlers:
++            h._kde_agent = True      # our handler tag (see above)
+         logging.basicConfig(
+             level=getattr(logging, self.cfg.log_level.upper(), logging.INFO),
+             format="%(asctime)s %(name)s %(levelname)s %(message)s",
+-            handlers=[logging.FileHandler(self.cfg.log_path),
+-                      logging.StreamHandler()])
++            handlers=handlers)
+ 
+     # ---------------- wiring ----------------
+     def subscribe(self) -> None:
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index 309a724..cdecff6 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -59,6 +59,47 @@ class TestTypoAnalyzer(unittest.TestCase):
+         self.assertEqual([x for x in v if x.kind == "path_segment"], [])
+ 
+ 
++class TestPathFalsePositives(unittest.TestCase):
++    """Regressions for the fs-verified-only rule: personal history and fuzzy
++    distances must NEVER outweigh live filesystem state (0550d85)."""
++
++    def setUp(self):
++        from agent.core.typo_model import Lexicon, ProposalEngine, MockModelAnalyzer
++        from agent.core.initiative import KNOWN_CMDS
++        self.fake_home = Path(tempfile.mkdtemp(prefix="kde-agent-home-"))
++        (self.fake_home / "Documents").mkdir()
++        os.environ["KDE_AGENT_HOME"] = str(self.fake_home)
++        self.lex = Lexicon(None)
++        self.an = MockModelAnalyzer(ProposalEngine(set(KNOWN_CMDS)))
++
++    def tearDown(self):
++        os.environ.pop("KDE_AGENT_HOME", None)
++
++    def _flagged_paths(self, line: str):
++        return [x for x in self.an.analyze_line(line, self.lex)
++                if x.kind == "path_segment"]
++
++    def test_learned_dict_cannot_invent_path_targets(self):
++        # user habitually types 'documnets' AND has a real ~/projects dir:
++        # neither history nor a close dictionary word may legitimize flagging
++        # '~/projects' as a typo of 'Documents' — projects exists on disk.
++        for _ in range(6):
++            self.lex.observe("cd ~/documnets")
++        self.assertEqual(self._flagged_paths("cd ~/projects"), [])
++
++    def test_true_typo_still_flagged_in_fake_home(self):
++        # 'Documnts' does not exist; verified sibling 'Documents' does -> flag
++        v = self._flagged_paths("cd ~/Documnts")
++        self.assertTrue(v, "expected fs-verified suggestion for ~/Documnts")
++        self.assertTrue(v[0].intended.endswith("/Documents"))
++
++    def test_new_directory_not_a_typo_even_if_close_to_history(self):
++        # fresh ~/projcts (distance 1 from observed 'projects') but nothing
++        # named that closely exists under HOME -> abstain, don't nag.
++        self.lex.observe("cd ~/projects")
++        self.assertEqual(self._flagged_paths("cd ~/projcts"), [])
++
++
+ class TestSafety(unittest.TestCase):
+     def setUp(self):
+         from agent.config import SafetyConfig
