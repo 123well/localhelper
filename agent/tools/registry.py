@@ -246,7 +246,7 @@ class ToolRegistry:
         self.memory._exec("DELETE FROM items WHERE id=? AND collection='reminders'",
                           (reminder_id,))
         self.memory._commit()
-        self.memory._cache = None
+        self.memory.invalidate_cache()
 
     # ---------------- KDE plumbing --------------------------------------------
     def dbus_call(self, service: str, path: str, iface: str, method: str,

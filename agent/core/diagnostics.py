@@ -174,7 +174,7 @@ def _check_all(ag, rep: DoctorReport) -> None:
         found = any(h.id == rid for h in hits)
         ag.memory._exec("DELETE FROM items WHERE id=?", (rid,))
         ag.memory._commit()
-        ag.memory._cache = None
+        ag.memory.invalidate_cache()
         st = "ok" if found else "warn"
         rep.add("векторная БД: запись/поиск", st,
                 f"items={before}, roundtrip={'попал' if found else 'НЕ найден'}")

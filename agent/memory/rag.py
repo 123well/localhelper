@@ -105,6 +105,11 @@ class Memory:
         with self.lock:
             self.db.commit()
 
+    def invalidate_cache(self) -> None:
+        """Thread-safe cache invalidation for external writers (CardStore)."""
+        with self.lock:
+            self._cache = None
+
     # ---- write ---------------------------------------------------------
     def add(self, collection: str, text: str, kind: str = "",
             meta: dict | None = None, value: float = 1.0) -> int:
@@ -128,8 +133,12 @@ class Memory:
         if self._cache is None:
             rows = self._exec(
                 "SELECT id,collection,text,meta,vec,value,hits FROM items").fetchall()
-            self._cache = [Hit(r[0], r[1], r[2], json.loads(r[3]), 0.0, r[5]) for r in rows]
-            self._vecs = np.stack([_vec(r[4]) for r in rows]) if rows else np.zeros((0, self.embedder.dim), np.float32)
+            cache = [Hit(r[0], r[1], r[2], json.loads(r[3]), 0.0, r[5]) for r in rows]
+            vecs = (np.stack([_vec(r[4]) for r in rows]) if rows
+                    else np.zeros((0, self.embedder.dim), np.float32))
+            with self.lock:
+                self._cache = cache
+                self._vecs = vecs
         return self._cache
 
     def search(self, query: str,
@@ -149,15 +158,16 @@ class Memory:
                 out.append(h)
                 if len(out) >= top_k:
                     break
-        self._exec("UPDATE items SET hits=hits+1 WHERE id=?",
-                   [(h.id,) for h in out])
-        self._commit()
+        # executemany, not execute(list-of-tuples): the latter raised
+        # ProgrammingError ("type 'tuple' is not supported") on every search.
+        with self.lock:
+            self.db.executemany("UPDATE items SET hits=hits+1 WHERE id=?",
+                                [(h.id,) for h in out])
+            self.db.commit()
         return out
 
     def recent_episodes(self, limit: int = 30) -> list[Hit]:
         rows = self._exec(
-            "SELECT id,meta,text,value FROM episodes_view ORDER BY ts DESC LIMIT ?",
-            (limit,)).fetchall() if False else self._exec(
             "SELECT id,meta,text,value,ts FROM items WHERE collection='episodes' "
             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         return [Hit(r[0], "episodes", r[2], json.loads(r[1]), 1.0, r[3]) for r in rows]
