@@ -149,12 +149,21 @@ class WindowState:
 
     # ---------- learning --------------------------------------------------
     def on_focus(self, wi: WindowInfo) -> None:
-        wi.last_focus = time.time()
+        now = time.time()
+        # rate-limit: one focus event per window per second (debounces KWin
+        # signal storms / synthetic rapid events; real switching is <1/sec)
+        if now - getattr(wi, "_last_event_ts", 0.0) < 1.0:
+            return
+        wi._last_event_ts = now
+        wi.last_focus = now
         wi.focus_count += 1
-        for prev in self.recent_focus[-3:]:
-            if prev != wi.cls:
-                self.cooccur.setdefault(prev, {})[wi.cls] = \
-                    self.cooccur.setdefault(prev, {}).get(wi.cls, 0) + 1
+        # co-occurrence: count each *transition* (prev class -> this class),
+        # not every window still present in the recent buffer — otherwise a
+        # single repeated focus inflates all older entries and ranking breaks.
+        if self.recent_focus and self.recent_focus[-1] != wi.cls:
+            prev = self.recent_focus[-1]
+            self.cooccur.setdefault(prev, {})[wi.cls] = \
+                self.cooccur.setdefault(prev, {}).get(wi.cls, 0) + 1
         self.recent_focus.append(wi.cls)
         del self.recent_focus[:-8]
         for kw in _project_keywords(wi.title):
@@ -162,8 +171,9 @@ class WindowState:
             d[wi.cls] = d.get(wi.cls, 0) + 1
 
     def suggest_for_context(self, keyword: str) -> list[tuple[str, int]]:
+        """Apps associated with a project keyword, ranked by focus events."""
         d = self.ctx_apps.get(keyword.lower(), {})
-        return sorted(d.items(), key=lambda kv: -kv[1])[:3]
+        return sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
 
     def companions(self, cls: str) -> list[tuple[str, int]]:
         d = self.cooccur.get(cls, {})

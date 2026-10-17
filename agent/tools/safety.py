@@ -106,10 +106,11 @@ class SafetyGate:
     def assess_path(self, path: str, write: bool = False) -> RiskDecision:
         p = Path(os.path.expanduser(path)).resolve()
         protected = [Path("/etc"), Path("/boot"), Path("/usr"), Path("/var"), Path("/sys"), Path("/proc")]
+        home = Path.home()   # read live: tests/daemon may relocate $HOME at runtime
         if write:
             if any(p == pr or pr in p.parents for pr in protected):
                 return RiskDecision("blocked", "системный путь только через явное подтверждение администратора")
-            if not (p == self.HOME or self.HOME in p.parents or p == Path.cwd()
+            if not (p == home or home in p.parents or p == Path.cwd()
                     or Path.cwd() in p.parents):
                 return RiskDecision("needs_confirm", f"запись вне домашней директории: {p}")
         return RiskDecision("safe")
