@@ -464,6 +464,11 @@ class InitiativeEngine:
             return 0.0
         return self.habits.resolve(iv, reaction)
 
+    def save(self) -> None:
+        """Persist habit/RPE state (called on shutdown; InitiativeEngine
+        itself is stateless beyond habits + pending)."""
+        self.habits.save()
+
     def intervene(self, line: str) -> list[Intervention]:
         """Detect + present in one call. Used by the event loop and tests so
         that interventions actually reach `pending` (on_user_line alone only

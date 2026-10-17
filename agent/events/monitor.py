@@ -67,11 +67,24 @@ class StdinSource:
         self.bus = bus
 
     async def run(self) -> None:
+        import os as _os
+        import sys
+        # /dev/null stdin (systemd service, `daemon < /dev/null`): nothing to
+        # watch. Connecting anyway makes asyncio register fd 0 with epoll and
+        # then crash in an *internal* callback (KeyError '0 is not registered'
+        # / PermissionError) that our try/except cannot even see.
+        try:
+            if _os.stat(sys.stdin.fileno()).st_rdev == \
+                    _os.stat(_os.devnull).st_rdev:
+                log.info("stdin is /dev/null; terminal source disabled")
+                return
+        except (OSError, ValueError):
+            pass
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         try:
             protocol = asyncio.StreamReaderProtocol(reader)
-            await loop.connect_read_pipe(lambda: protocol, __import__("sys").stdin)
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         except (OSError, ValueError, PermissionError):        # not a tty (tests)
             return
         while True:
