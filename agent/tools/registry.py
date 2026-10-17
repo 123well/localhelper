@@ -21,6 +21,8 @@ class ToolRegistry:
         self.cfg, self.memory, self.safety, self.bridge = cfg, memory, safety, bridge
         self.cards = cards          # CardStore | None (knowledge subsystem)
         self.last_undo: tuple | None = None
+        # Code assistant registers text-edit undo entries here (kind "edit").
+        self._undo_edits: list[tuple] = []
         self._term_history: list[tuple[str, str]] = []
         self._tools = {
             "exec_command": self.exec_command,
@@ -230,7 +232,28 @@ class ToolRegistry:
         self.bridge.notify("KDE Agent", f"Могу автоматизировать: {pattern[:80]}")
         return "OK: предложение автоматизации отправлено"
 
+    def register_edit_undo(self, entry: tuple) -> None:
+        """Undo sink for the code assistant: ('edit', path, old_content|None)."""
+        if isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "edit":
+            self._undo_edits.append(entry)
+
     def undo_last(self) -> str:
+        # text edits from the code assistant take precedence (LIFO), then the
+        # shell-op snapshot journal (rm/mv backups) from SafetyGate
+        while self._undo_edits:
+            _, path, old = self._undo_edits.pop()
+            target = Path(path)
+            try:
+                if old is None:
+                    if target.exists():
+                        target.unlink()
+                    return f"отменено: {path} удалён (был создан агентом)"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(old)
+                self.memory.episode("undo", f"restored {path}", value=1.2)
+                return f"отменено: содержимое {path} восстановлено"
+            except OSError as e:
+                return f"ОТМЕНА НЕ УДАЛАСЬ: {e}"
         if not self.last_undo:
             return "Нечего отменять"
         snap, backup = self.last_undo
