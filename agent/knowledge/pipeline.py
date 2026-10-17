@@ -143,9 +143,13 @@ class StudyQueue:
             self.db.commit()
 
     def enqueue(self, src: Source) -> None:
+        # INSERT OR IGNORE semantics for already-known paths: the old
+        # INSERT OR REPLACE reset processed docs back to 'queued' on every
+        # bootstrap (empty-KB self-seed), so each daemon start re-queued the
+        # whole backlog and logged a scary "N docs queued" line.
         self._exec(
-            "INSERT OR REPLACE INTO study_queue(path,priority,project,status,error,ts)"
-            " VALUES(?,?,?,?,?,?)",
+            "INSERT INTO study_queue(path,priority,project,status,error,ts)"
+            " VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
             (src.path, src.priority, src.project, src.status, src.error, time.time()))
         self._commit()
 
@@ -212,7 +216,9 @@ class StudyPipeline:
         self.last_report: dict = {}
 
     def ingest_dir(self, root: str, project: str = "", priority: int = 5,
-                   patterns=("*/*.md", "*.md", "*.rst", "*.py", "*.txt")) -> int:
+                   patterns=("*/*.md", "*.md", "*.rst", "*.py", "*.txt"),
+                   skip_dirs=(".venv", "venv", ".git", "__pycache__", "node_modules",
+                              ".mypy_cache", ".pytest_cache", "site-packages")) -> int:
         rp = Path(root).expanduser()
         if not rp.exists():
             log.warning("ingest: %s missing", rp)
@@ -220,9 +226,15 @@ class StudyPipeline:
         n = 0
         for pat in patterns:
             for p in sorted(rp.rglob(pat)):
-                if p.is_file() and ".git" not in p.parts:
-                    self.queue.enqueue(Source(path=str(p), priority=priority, project=project))
-                    n += 1
+                # guard against venv/site-packages floods: rglob over a repo
+                # root used to enqueue 900+ interpreter stdlib/venv files
+                if not p.is_file():
+                    continue
+                parts = set(p.parts)
+                if parts & set(skip_dirs):
+                    continue
+                self.queue.enqueue(Source(path=str(p), priority=priority, project=project))
+                n += 1
         return n
 
     def process_one(self, src: Source) -> dict:

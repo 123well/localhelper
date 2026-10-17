@@ -322,16 +322,25 @@ class ControlMixin:
         return {"ok": False, "error": "scenario list|show <имя>|remove <имя>"}
 
     def _ctl_status(self) -> dict:
-        return {"ok": True, "running": self.running,
-                "mode": self.safety.mode,
-                "proactivity": bool(getattr(self.cfg.initiative, "enabled", True)),
-                "backend": type(self.model.backend).__name__,
-                "adapter": self.model.adapter_version,
-                "ctx_tokens": self.ctx.total(),
-                "pending_interventions": list(self.initiative.pending)[:5],
-                "channels": self.cfg.output_channels,
-                "kb": self.cards.quality_report() if self.cards else "disabled",
-                "sleep_last": (self.cfg.data_dir / "last_sleep.json").exists()}
+        st = {"ok": True, "running": self.running,
+              "mode": self.safety.mode,
+              "proactivity": bool(getattr(self.cfg.initiative, "enabled", True)),
+              "backend": type(self.model.backend).__name__,
+              "adapter": self.model.adapter_version,
+              "ctx_tokens": self.ctx.total(),
+              "pending_interventions": list(self.initiative.pending)[:5],
+              "channels": self.cfg.output_channels,
+              "kb": self.cards.quality_report() if self.cards else "disabled",
+              "sleep_last": (self.cfg.data_dir / "last_sleep.json").exists()}
+        # study backlog visible in status: previously only appeared as a log
+        # line at boot ("bootstrap study: N docs queued") which looked like
+        # debug noise with no way to inspect it afterwards.
+        if self.study is not None:
+            try:
+                st["study_queue"] = self.study.queue.stats()
+            except Exception:  # noqa: BLE001  status must never fail on stats
+                st["study_queue"] = "error"
+        return st
 
     def _ctl_kb(self, arg: str) -> dict:
         if self.cards is None:

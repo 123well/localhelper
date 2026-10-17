@@ -96,7 +96,7 @@ class Agent(ControlMixin):
         self.tools.scenarios = self.scenarios
         self.tools.scenario_runner = self.scenario_runner
         if self.cards is not None:
-            from agent.knowledge.pipeline import EnergyGate, StudyPipeline, StudyQueue
+            from agent.knowledge.pipeline import EnergyGate, Source, StudyPipeline, StudyQueue
             queue = StudyQueue(self.cfg.data_dir / "study_queue.db")
             gate = EnergyGate(on_battery=self.bridge.on_battery,
                               idle_sec=self.bridge.idle_seconds)
@@ -111,8 +111,20 @@ class Agent(ControlMixin):
                 empty_kb = self.cards.quality_report().get("cards", 0) == 0
                 n = 0
                 if empty_kb:
-                    n += self.study.ingest_dir(str(Path(__file__).resolve().parent.parent),
-                                               project="agent-self", priority=3)
+                    # scope: README/docs/tests only — NOT the whole repo.
+                    # rglob("*/*.py") over the project root used to enqueue
+                    # every venv/site-packages file (900+ "docs"), which made
+                    # bootstrap look like debug junk and starved real study.
+                    root = Path(__file__).resolve().parent.parent
+                    for sub in ("docs", "tests"):
+                        d = root / sub
+                        if d.is_dir():
+                            n += self.study.ingest_dir(str(d), project="agent-self", priority=3)
+                    readme = root / "README.md"
+                    if readme.is_file():
+                        self.study.queue.enqueue(Source(path=str(readme), priority=3,
+                                                        project="agent-self"))
+                        n += 1
                 for d in self.cfg.knowledge.auto_study_dirs:
                     n += self.study.ingest_dir(d, project="user-dir", priority=2)
                 if n:
