@@ -45,25 +45,41 @@ def _policy_matrix(vocab: int, d: int):
     token ids to emit the agent JSON-contract answers.
     Returns (C_out, {last_char: (pattern_str, start_idx)} for diagnostics).
     """
-    # rows are ONE-HOT on purpose: with random rows the argmax was dominated
-    # by a shared hidden-state direction (every token scored ~3e9), so no
-    # policy could ever win. One-hot + bias below keeps the tiny graph fully
-    # deterministic; real graphs replace this whole matrix with trained heads.
-    C = np.full((d, vocab), -1e-6, dtype=np.float32)
+    # Rows are ONE-HOT on the *streaming position* k, not on channel 0.
+    # The backend feeds prompt tokens one-by-one WITHOUT attention and picks
+    # the next token as argmax(hid @ C_out).  hid mixes every channel, so a
+    # channel-0 spike made the same column win at every step regardless of
+    # context (the old 'AAAA...' failure).  With C_out[k, tok] = 1 the graph
+    # emits text[k] at decode step k: logits = one_hot(pos) @ C_out, exactly
+    # the deterministic scripted-policy contract.  Real graphs replace this
+    # whole matrix with trained heads.
     filler = "ok"
-    # default behaviour everywhere: 'o' -> 'k' -> </s>
+    EOS_ID = 95   # </s> id (see build_tokenizer); asserted there too
+
     def _ascii_only(s):
         return "".join(c for c in s if 32 <= ord(c) < 127)
 
+    C = np.zeros((d, vocab), dtype=np.float32)
+
     def set_row(row_id, seq):
+        """Scripted output emitted when the last prefill token has id `row_id`.
+
+        Channels 0..len-1 carry one-hot ids of text[k]; channel `eos_ch` is a
+        dedicated stop-marker whose only winning vocabulary column is EOS_ID,
+        so after the script ends the graph emits </s> and generation halts.
+        """
         seq = _ascii_only(seq)
-        c = np.zeros(d, dtype=np.float32)
-        c[0] = 1.0
-        C[:, row_id] = c
+        eos_ch = d - 1
+        if len(seq) + 1 > eos_ch:
+            print(f"WARN: pattern for id {row_id} ({len(seq)} chars) truncated "
+                  f"at d={d}; raise --d to emit it fully")
+            seq = seq[:eos_ch]
+        col = C[:, row_id]
+        col[:] = 0.0
         for k, ch in enumerate(seq):
-            if k < d - 1:
-                C[k, ord(ch)] = 1.0
-        C[min(len(seq), d - 1), 95] = 1.0   # </s> is id 95 (see build_tokenizer)
+            col[k] = float(ord(ch))          # decode step k -> token ord(ch)
+        col[eos_ch] = float(EOS_ID)          # stop step -> </s>
+
     for r in range(vocab):
         set_row(r, filler)
     # (last prefill char, full emitted text) — text starts at index 0 of C rows
@@ -81,16 +97,7 @@ def _policy_matrix(vocab: int, d: int):
     for last_ch, text in patterns.items():
         text = _ascii_only(text)
         row = ord(last_ch)
-        c = np.zeros(d, dtype=np.float32)
-        c[0] = 1.0
-        C[:, row] = c
-        for k, ch in enumerate(text):
-            if k < d - 1:
-                C[k, ord(ch)] = 1.0
-        if len(text) >= d - 1:
-            print(f"WARN: pattern for {last_ch!r} ({len(text)} chars) truncated "
-                  f"at d={d}; raise --d to emit it fully")
-        C[min(len(text), d - 1), 95] = 1.0
+        set_row(row, text)
         diag[last_ch] = (text, row)
     return C, diag
 
