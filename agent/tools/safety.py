@@ -31,7 +31,34 @@ class SafetyGate:
     def __init__(self, cfg):
         self.cfg = cfg  # SafetyConfig
 
+    # ---- operating mode (spec: safe / confirm_all / read_only) ------------
+    @property
+    def mode(self) -> str:
+        return getattr(self.cfg, "mode", "normal")
+
+    def set_mode(self, mode: str) -> RiskDecision | None:
+        if mode not in ("normal", "safe", "confirm_all", "read_only"):
+            return RiskDecision("blocked", f"неизвестный режим: {mode}")
+        self.cfg.mode = mode
+        return None
+
+    def assess_tool_call(self, tool: str, mutating: bool) -> RiskDecision:
+        """Mode policy applied BEFORE any per-tool risk assessment.
+        Read-only tools (search/read/list/screen_state) stay available even in
+        safe mode — the agent must still answer and propose, just not act."""
+        m = self.mode
+        if m == "safe" and mutating:
+            return RiskDecision("blocked",
+                                "безопасный режим: выполнение/запись запрещены, только анализ и предложения")
+        if m == "read_only" and mutating:
+            return RiskDecision("blocked", "режим «только чтение»: изменения запрещены")
+        if m == "confirm_all":
+            return RiskDecision("needs_confirm", "режим подтверждения всех действий")
+        return RiskDecision("safe")
+
     # ---- command risk ----------------------------------------------------
+    _SHELL_META = re.compile(r"[|;&<>`$*]|\$\(")
+
     def assess_command(self, cmd: str) -> RiskDecision:
         c = cmd.strip()
         low = c.lower()
@@ -45,7 +72,16 @@ class SafetyGate:
             return RiskDecision("needs_confirm", "деструктивная операция", safer)
         if any(low.startswith(p.strip()) or p in low for p in self.cfg.require_confirm_prefixes):
             return RiskDecision("needs_confirm", f"префикс «{next((p for p in self.cfg.require_confirm_prefixes if p.strip() in low), '')}» требует подтверждения")
-        if any(fnmatch.fnmatch(low, w) or low.split() and low.split()[0] == w
+        # Whitelist is a shortcut ONLY for plain single commands. A composite
+        # shell line that merely STARTS with a whitelisted word ("ls; rm -rf ~",
+        # "echo x > /home/user/.ssh/rc") must never inherit the exemption —
+        # otherwise prefix matching silently legalizes arbitrary payloads run
+        # through shell=True. (Previously whitelist returned "safe" before any
+        # such check and its result was indistinguishable from the default.)
+        if self._SHELL_META.search(c):
+            return RiskDecision("needs_confirm",
+                                "shell-мета-символы (; | & > < $ *) требуют подтверждения")
+        if any(fnmatch.fnmatch(low, w) or (low.split() and low.split()[0] == w)
                for w in self.cfg.whitelist):
             return RiskDecision("safe")
         return RiskDecision("safe")

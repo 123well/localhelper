@@ -114,7 +114,7 @@ class Memory:
         return self._cache
 
     def search(self, query: str,
-               collections: tuple[str, ...] = ("docs", "episodes", "prefs", "cards"),
+               collections: tuple[str, ...] = ("docs", "episodes", "prefs", "cards", "reminders"),
                top_k: int = 5, min_value: float = 0.0) -> list[Hit]:
         hits = self._all()
         if not hits:

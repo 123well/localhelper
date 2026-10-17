@@ -15,6 +15,11 @@ log = logging.getLogger("kde-agent.tools")
 
 CMD_TIMEOUT = 30
 
+# Tools that change system state (execution/writes/GUI input). Everything else
+# is observational (read/search/list) and stays allowed in safe/read_only modes.
+MUTATING_TOOLS = {"exec_command", "write_file", "click", "type_text", "open_app",
+                  "dbus_call", "undo_last", "propose_automation"}
+
 
 class ToolRegistry:
     def __init__(self, cfg, memory, safety, bridge, cards=None):
@@ -55,6 +60,21 @@ class ToolRegistry:
         fn = self._tools.get(tool)
         if not fn:
             return f"ERROR: unknown tool '{tool}'. Available: {', '.join(self.names())}"
+        # Operating-mode policy first (safe / read_only block all mutations;
+        # confirm_all forces explicit user approval for every action).
+        mode_decision = self.safety.assess_tool_call(tool, tool in MUTATING_TOOLS)
+        if mode_decision.level == "blocked":
+            out = f"BLOCKED: {mode_decision.reason} (режим «{self.safety.mode}»)"
+            self.memory.episode("tool", f"{tool} blocked by mode")
+            return out
+        if mode_decision.level == "needs_confirm" and tool in MUTATING_TOOLS \
+                and not args.get("confirmed"):
+            if not self.bridge.confirm(f"Режим подтверждения всех действий: выполнить `{tool}` "
+                                        f"с аргументами {json.dumps(args, ensure_ascii=False)[:200]}?"):
+                out = "CANCELLED_BY_USER: пользователь отклонил операцию (режим confirm_all)."
+                self.memory.episode("cancel", f"confirm_all refused {tool}")
+                return out
+            args = {**args, "confirmed": True}
         try:
             res = fn(**args)
             if asyncio.iscoroutine(res):
@@ -205,6 +225,28 @@ class ToolRegistry:
     def set_reminder(self, text: str, minutes: int = 10) -> str:
         self.memory.add("reminders", text, "reminder", {"due": time.time() + minutes * 60})
         return f"OK: напоминание через {minutes} мин: {text}"
+
+    def due_reminders(self) -> list[tuple[int, str]]:
+        """Reminders past their due time (called by the scheduler tick).
+        Fixes the write-only dead collection: previously nothing ever read them."""
+        rows = self.memory.db.execute(
+            "SELECT id,text,meta FROM items WHERE collection='reminders'").fetchall()
+        now = time.time()
+        out = []
+        for rid, text, meta in rows:
+            try:
+                due = float(json.loads(meta or "{}").get("due", 0))
+            except (ValueError, TypeError):
+                continue
+            if due and now >= due:
+                out.append((rid, text))
+        return out
+
+    def acknowledge_reminder(self, reminder_id: int) -> None:
+        self.memory.db.execute("DELETE FROM items WHERE id=? AND collection='reminders'",
+                               (reminder_id,))
+        self.memory.db.commit()
+        self.memory._cache = None
 
     # ---------------- KDE plumbing --------------------------------------------
     def dbus_call(self, service: str, path: str, iface: str, method: str,

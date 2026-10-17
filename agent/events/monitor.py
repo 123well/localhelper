@@ -75,7 +75,13 @@ class StdinSource:
         except (OSError, ValueError):        # not a tty (tests)
             return
         while True:
-            line = (await reader.readline()).decode(errors="replace").strip()
+            raw = await reader.readline()
+            if not raw:
+                # EOF (daemon under systemd: stdin closed) — exit quietly.
+                # The old `continue` spun a busy-loop forever (energy bug).
+                log.info("stdin closed; terminal source stopped")
+                return
+            line = raw.decode(errors="replace").strip()
             if not line:
                 continue
             self.bus.emit("user_request", text=line)
@@ -126,6 +132,8 @@ class IdleWatcher:
         while True:
             await asyncio.sleep(60)          # 1 wake/min: negligible energy
             idle = self.bridge.idle_seconds()
+            if idle < 0:
+                continue          # no idle source available: stay silent
             if idle >= self.thr and time.time() - self.fired_at > 1800:
                 self.fired_at = time.time()
                 self.bus.emit("idle", idle_sec=idle)
