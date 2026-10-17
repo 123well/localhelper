@@ -32,6 +32,11 @@ class KDEBridge:
     def __init__(self):
         self.bus = None
         self._notif = None
+        # `available` is read by the output-channel router and diagnostics;
+        # it must exist BEFORE connect() is ever called (regression: it was
+        # never assigned anywhere, so Channels._notify raised AttributeError
+        # on every notification attempt in headless mode).
+        self.available = False
         self.reply_hooks: dict[str, Callable[[str], None]] = {}
 
     # ---------- connection ------------------------------------------------
@@ -44,9 +49,11 @@ class KDEBridge:
             self._notif = self.bus.get_object(
                 "org.freedesktop.Notifications",
                 "/org/freedesktop/Notifications").get_interface(introspec)
+            self.available = True
             log.info("connected to plasmashell notifications")
             return True
         except Exception as e:  # noqa: BLE001
+            self.available = False
             log.debug("D-Bus unavailable: %s (headless mode)", e)
             return False
 

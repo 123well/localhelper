@@ -19,10 +19,26 @@ class RiskDecision:
     safer: str | None = None
 
 
-DANGEROUS_PATTERNS = [r"\brm\s+(-[a-zA-Z]*\s+)*(/|/home\b|~)(\s|$)", r">\s*/etc/",
-                      r"\bchmod\s+-R\b", r"\bchown\s+-R\b", r"\bgit\s+push\s+.*--force",
-                      r"\bgit\s+reset\s+--hard\b", r"\bkill(all)?\b", r"\bshutdown\b",
-                      r"\breboot\b"]
+# NOTE on the leading `\s*` in each pattern: these are matched with re.search,
+# so without an anchor a *substring* hit would escalate innocent commands —
+# "cat /etc/passwd" used to match `>\s*/etc/` (the "t /etc/" fragment) and was
+# reported as blocked, which permanently failed 1/5 sleep-gate probes and made
+# the regression score drift. Every pattern is now anchored at command start.
+DANGEROUS_PATTERNS = [r"^\s*\brm\s+(-[a-zA-Z]*\s+)*(/|/home\b|~)(\s|$)",
+                      r"^\s*echo\b.*>>?\s*/etc/",
+                      r"^\s*(tee|dd)\b.*\s/dev/(sd|nvme|hd)",
+                      r"^\s*\bchmod\s+(?:-[a-zA-Z]+\s+)*-R\b",
+                      r"^\s*\bchown\s+(?:-[a-zA-Z]+\s+)*-R\b",
+                      r"^\s*\bgit\s+push\s+.*--force",
+                      r"^\s*\bgit\s+reset\s+--hard\b",
+                      r"^\s*\bkillall\b",
+                      r"^\s*\bshutdown\b",
+                      r"^\s*\breboot\b",
+                      # pipes into an interpreter = arbitrary code execution:
+                      # only count a pipe that is actually followed by sh/bash/zsh
+                      # (a plain `grep x | y` must NOT be flagged).
+                      r"\|\s*(?:sudo\s+)?(?:ba|z)?sh\b",
+                      ]
 
 
 class SafetyGate:
