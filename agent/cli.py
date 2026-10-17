@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 
 
@@ -95,6 +96,10 @@ async def _daemon_main(interactive: bool = False) -> int:
     from agent.main import Agent
     ag = Agent(interactive=interactive)   # `run` keeps the stdin REPL;
                                           # `daemon` must never attach to fd 0
+    if interactive:
+        # explicit opt-in for terminal confirmations (see KDEBridge.confirm);
+        # tests/daemon never set it => deny-by-default, no input() blocking
+        os.environ["KDE_AGENT_INTERACTIVE"] = "1"
     loop = asyncio.get_running_loop()
 
     # ---- single-instance guard ---------------------------------------------

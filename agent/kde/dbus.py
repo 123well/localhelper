@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -71,7 +72,9 @@ class KDEBridge:
     def notify(self, title: str, body: str, actions: list[str] | None = None,
                reply_key: str | None = None, urgency: str = "low",
                timeout_ms: int = 12000) -> None:
-        if reply_key and actions:
+        # NOTE: never overwrite a hook registered by the caller (initiative
+        # registers the real feedback closure before calling notify()).
+        if reply_key and actions and reply_key not in self.reply_hooks:
             self.reply_hooks[reply_key] = lambda act: log.info(
                 "notification answer %s -> %s", reply_key, act)
         if self._notif is None:
@@ -129,7 +132,12 @@ class KDEBridge:
         """
         interactive_stdin = False
         try:
-            interactive_stdin = __import__("sys").stdin.isatty()
+            import sys
+            # isatty() alone lies under `python -m unittest` (stdin is the tty);
+            # require an explicit opt-in env flag so background/test processes
+            # NEVER block on input(). Only `kde-agent run` sets this.
+            interactive_stdin = (sys.stdin.isatty() and
+                                 os.environ.get("KDE_AGENT_INTERACTIVE") == "1")
         except Exception:  # noqa: BLE001
             interactive_stdin = False
         if shutil.which("kdialog") and _has_display():

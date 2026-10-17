@@ -22,10 +22,12 @@ def _fresh_env():
 
 
 def _snapshot(n_kate=5, stale=True, active_title="~/dev/myproj — main.py"):
+    # titles are app-style: "project — file" (kate/konsole format), so the
+    # project keyword is extracted consistently from every window
     wins = []
     now = time.time()
     for i in range(n_kate):
-        wins.append({"wid": f"0x10{i}", "title": f"file{i}.py — myproj",
+        wins.append({"wid": f"0x10{i}", "title": f"myproj — file{i}.py",
                      "class": "kate",
                      "active": False})
     wins.append({"wid": "0x200", "title": active_title, "class": "konsole",
@@ -197,13 +199,21 @@ class TestScenarios(unittest.TestCase):
 
     def test_failed_step_records_and_undoes(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="sc-undo-"))
-        target = tmpdir / "f.txt"
-        self.ag.scenarios.save("исправить", "запись с откатом",
-                               [{"tool": "write_file",
-                                 "args": {"path": str(target), "content": "v2"}},
-                                {"tool": "exec_command",
-                                 "args": {"command": "false-command-xyz"}}])
-        rep = asyncio.run(self.ag.scenario_runner.run("исправить"))
+        # HOME-scoped path: write_file outside $HOME requires confirmation,
+        # which is deny-by-default in headless tests (that would mask the
+        # actual failure-under-test at step 1 instead of step 2)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(tmpdir)
+        try:
+            target = tmpdir / "f.txt"
+            self.ag.scenarios.save("исправить", "запись с откатом",
+                                   [{"tool": "write_file",
+                                     "args": {"path": str(target), "content": "v2"}},
+                                    {"tool": "exec_command",
+                                     "args": {"command": "false-command-xyz"}}])
+            rep = asyncio.run(self.ag.scenario_runner.run("исправить"))
+        finally:
+            os.environ["HOME"] = old_home or "/root"
         self.assertFalse(rep["ok"])
         self.assertEqual(rep.get("failed_at"), 2)
         # undo not registered for write_file step here; failure recorded in store
