@@ -59,6 +59,47 @@ class TestTypoAnalyzer(unittest.TestCase):
         self.assertEqual([x for x in v if x.kind == "path_segment"], [])
 
 
+class TestPathFalsePositives(unittest.TestCase):
+    """Regressions for the fs-verified-only rule: personal history and fuzzy
+    distances must NEVER outweigh live filesystem state (0550d85)."""
+
+    def setUp(self):
+        from agent.core.typo_model import Lexicon, ProposalEngine, MockModelAnalyzer
+        from agent.core.initiative import KNOWN_CMDS
+        self.fake_home = Path(tempfile.mkdtemp(prefix="kde-agent-home-"))
+        (self.fake_home / "Documents").mkdir()
+        os.environ["KDE_AGENT_HOME"] = str(self.fake_home)
+        self.lex = Lexicon(None)
+        self.an = MockModelAnalyzer(ProposalEngine(set(KNOWN_CMDS)))
+
+    def tearDown(self):
+        os.environ.pop("KDE_AGENT_HOME", None)
+
+    def _flagged_paths(self, line: str):
+        return [x for x in self.an.analyze_line(line, self.lex)
+                if x.kind == "path_segment"]
+
+    def test_learned_dict_cannot_invent_path_targets(self):
+        # user habitually types 'documnets' AND has a real ~/projects dir:
+        # neither history nor a close dictionary word may legitimize flagging
+        # '~/projects' as a typo of 'Documents' — projects exists on disk.
+        for _ in range(6):
+            self.lex.observe("cd ~/documnets")
+        self.assertEqual(self._flagged_paths("cd ~/projects"), [])
+
+    def test_true_typo_still_flagged_in_fake_home(self):
+        # 'Documnts' does not exist; verified sibling 'Documents' does -> flag
+        v = self._flagged_paths("cd ~/Documnts")
+        self.assertTrue(v, "expected fs-verified suggestion for ~/Documnts")
+        self.assertTrue(v[0].intended.endswith("/Documents"))
+
+    def test_new_directory_not_a_typo_even_if_close_to_history(self):
+        # fresh ~/projcts (distance 1 from observed 'projects') but nothing
+        # named that closely exists under HOME -> abstain, don't nag.
+        self.lex.observe("cd ~/projects")
+        self.assertEqual(self._flagged_paths("cd ~/projcts"), [])
+
+
 class TestSafety(unittest.TestCase):
     def setUp(self):
         from agent.config import SafetyConfig

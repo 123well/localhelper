@@ -59,11 +59,25 @@ class Agent:
 
     def _setup_logging(self) -> None:
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger()
+        # Idempotent: re-running setup (tests, reloads) must not stack
+        # handlers — every extra FileHandler keeps a duplicate log file
+        # open (ResourceWarning) and multiplies every log line.
+        for h in list(root.handlers):
+            if getattr(h, "_kde_agent", False):
+                root.removeHandler(h)
+                try:
+                    h.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        handlers = [logging.FileHandler(self.cfg.log_path),
+                    logging.StreamHandler()]
+        for h in handlers:
+            h._kde_agent = True      # our handler tag (see above)
         logging.basicConfig(
             level=getattr(logging, self.cfg.log_level.upper(), logging.INFO),
             format="%(asctime)s %(name)s %(levelname)s %(message)s",
-            handlers=[logging.FileHandler(self.cfg.log_path),
-                      logging.StreamHandler()])
+            handlers=handlers)
 
     # ---------------- wiring ----------------
     def subscribe(self) -> None:

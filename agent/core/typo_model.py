@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -150,6 +151,25 @@ class Lexicon:
     def __init__(self, memory=None):
         self.memory = memory
         self.user_words: dict[str, int] = {}   # token -> observed count
+        self._home_names: set[str] = set()     # lazy live scan of HOME entries
+        self._home_scan_ts: float = 0.0        # last refresh time (5 s budget)
+
+    def home_dir_names(self) -> set[str]:
+        """Live (cheap, throttled) listing of names under $HOME. Used by the
+        proposal engine to verify that a learned-dict path candidate actually
+        exists on disk before it may be proposed — history alone is not proof."""
+        now = time.monotonic()
+        if now - self._home_scan_ts >= 5.0:
+            self._home_scan_ts = now
+            try:
+                self._home_names = {p.name for p in _home_dir().iterdir()}
+            except OSError:
+                pass
+        return self._home_names
+
+    def home_name_exists(self, name: str) -> bool:
+        low = name.lower()
+        return any(n.lower() == low for n in self.home_dir_names())
 
     def observe(self, line: str) -> None:
         for tok in re.findall(r"[\w][\w._-]{1,}", line):
@@ -228,12 +248,23 @@ class ProposalEngine:
         out.sort(key=lambda c: c.evidence["rel"])
         return out[:6]
 
+    # ---- live HOME verification helpers --------------------------------------
+    def _home_names(self, lex: Lexicon) -> set[str]:
+        """Names under HOME (throttled lazy scan owned by the Lexicon)."""
+        return lex.home_dir_names()
+
+    def _home_name_exists(self, lex: Lexicon, name: str) -> bool:
+        return lex.home_name_exists(name)
+
     # ---- paths ---------------------------------------------------------------
     def check_path(self, p: str, lex: Lexicon) -> tuple[str, list[Candidate]] | None:
         """Walk segments; first non-existent segment whose siblings/dictionary
         contain a close EXISTING name => propose it. New-file names at the end
         of an existing directory are normal (touch foo.txt) -> no proposal."""
-        expanded = os.path.expanduser(p)
+        expanded = p
+        if expanded.startswith("~"):
+            expanded = str(_home_dir()) + expanded[1:]
+        expanded = os.path.expanduser(expanded)
         if Path(expanded).exists():
             return None
         # walk the path with '~' already resolved; a literal '~' segment would
@@ -267,24 +298,46 @@ class ProposalEngine:
             if s.lower() == low:
                 continue
             wd = weighted_distance(low, s.lower())
-            if wd <= max(2.0, len(low) * 0.55):
+            # same acceptance gate as the invariant for paths:
+            # wdist <= max(2, len*0.55) AND char_jaccard >= 0.5 — without the
+            # jaccard floor unrelated sibling names (Documents vs projects)
+            # slip through on long segments and create false positives
+            if wd <= max(2.0, len(low) * 0.55) and char_jaccard(low, s.lower()) >= 0.5:
                 # target_exists: verified live fact — the sibling is present on
                 # disk right now (checked again at judgement time below)
                 cands.append(Candidate(s, "path_segment", "filesystem",
                                        {"wdist": round(wd, 2),
                                         "rel": round(wd / max(1, len(low)), 3),
                                         "target_exists": True}))
+        # learned-dict candidates must be VERIFIED against the live filesystem:
+        # a personal token only qualifies if a name that close actually exists
+        # under the verified prefix (siblings above) or somewhere under HOME
+        # (lazy scan, refreshed at most once per 5 s). Otherwise a brand-new
+        # directory like ~/projects would look like a typo of ~/Documents.
+        home_names = self._home_names(lex)
         for v, freq in lex.user_words.items():
             if v == low or v in siblings:
                 continue
             wd = weighted_distance(low, v)
-            if wd <= 2.0:
-                cands.append(Candidate(v, "path_segment", "learned_dict",
-                                       {"wdist": round(wd, 2), "freq": freq,
-                                        "rel": round(wd / max(1, len(low)), 3)}))
+            if wd > max(2.0, len(low) * 0.55):
+                continue
+            if char_jaccard(low, v) < 0.5:
+                continue
+            exists_near = any(
+                Path(acc, cand).exists()
+                for cand in home_names
+                if weighted_distance(low, cand.lower()) <= max(2.0, len(low) * 0.55)
+                and char_jaccard(low, cand.lower()) >= 0.5
+            )
+            if not exists_near:
+                continue
+            cands.append(Candidate(v, "path_segment", "learned_dict",
+                                   {"wdist": round(wd, 2), "freq": freq,
+                                    "rel": round(wd / max(1, len(low)), 3),
+                                    "target_exists": exists_near}))
         dec = layout_switch_rev(seg)
         if dec != seg and (dec.lower() in {s.lower() for s in siblings}
-                           or lex.known(dec)):
+                           or self._home_name_exists(lex, dec)):
             cands.append(Candidate(dec, "path_segment", "layout",
                                    {"decoded": True, "wdist": 0.0, "rel": 0.0}))
         if not cands:
@@ -294,6 +347,15 @@ class ProposalEngine:
 
 
 PATH_RE = re.compile(r"(?:~?/|\./)[\w.@+\-/]*")
+
+
+def _home_dir() -> Path:
+    """HOME used for live verification — overridable via KDE_AGENT_HOME so
+    tests can point it at a fake home directory."""
+    return Path(os.environ.get("KDE_AGENT_HOME") or str(Path.home()))
+
+
+# (helpers attached to ProposalEngine below)
 
 
 class ModelTypoAnalyzer:
