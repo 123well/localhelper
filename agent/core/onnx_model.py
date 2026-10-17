@@ -112,14 +112,52 @@ class OnnxSsmBackend:
         nxt = None
         for tok in ids:                      # prefill: feed prompt tokens
             _, nxt = self._step(int(tok))    # last step yields first sample
+        stop_early = self._looks_like_json(prompt)
         for _ in range(max(1, limit)):
             if nxt is None:                  # prefill skipped (shouldn't happen)
                 break
             if nxt == self.eos_id:
                 break
             out_ids.append(nxt)
+            # Contract consumers (ReAct loop, typo analyzer) parse the FIRST
+            # complete JSON object; anything after it is model noise.  When the
+            # prompt demands JSON, stop as soon as braces balance — this also
+            # shields callers from drift in tiny/test graphs whose recurrent
+            # state cannot sustain a long deterministic script.
+            if stop_early and self._json_complete(self._decode(out_ids)):
+                break
             _, nxt = self._step(nxt)
         return self._decode(out_ids)
+
+    @staticmethod
+    def _looks_like_json(prompt: str) -> bool:
+        p = prompt.lower()
+        return "json" in p or "assistant:" in p
+
+    @staticmethod
+    def _json_complete(text: str) -> bool:
+        """True once the first '{' is matched by its closing '}' (string-aware)."""
+        start = text.find("{")
+        if start < 0:
+            return False
+        depth, in_str, esc = 0, False, False
+        for ch in text[start:]:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return True
+        return False
 
     # ---- tokenization ---------------------------------------------------------
     # The prototype tokenizer is char-level (every printable ASCII char is one

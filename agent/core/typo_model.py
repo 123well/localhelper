@@ -547,8 +547,8 @@ ASSISTANT:"""
                 rag=(rag_context[:600] or "(none)"))
             try:
                 raw = self.backend.generate(prompt, max_tokens=160)
-                m = re.search(r"\{.*\}", raw, re.S)
-                d = json.loads(m.group(0)) if m else None
+                from agent.core.model import parse_first_json
+                d = parse_first_json(raw)
                 if isinstance(d, dict) and isinstance(d.get("is_typo"), bool):
                     conf = float(d.get("confidence", v.confidence))
                     v.is_typo = bool(d["is_typo"]) and conf >= 0.4
