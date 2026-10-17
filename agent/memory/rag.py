@@ -130,16 +130,16 @@ class Memory:
 
     # ---- read -----------------------------------------------------------
     def _all(self) -> list[Hit]:
-        if self._cache is None:
-            rows = self._exec(
-                "SELECT id,collection,text,meta,vec,value,hits FROM items").fetchall()
-            cache = [Hit(r[0], r[1], r[2], json.loads(r[3]), 0.0, r[5]) for r in rows]
-            vecs = (np.stack([_vec(r[4]) for r in rows]) if rows
-                    else np.zeros((0, self.embedder.dim), np.float32))
-            with self.lock:
+        with self.lock:                # cache build is a read+swap RMW flow;
+            if self._cache is None:    # two threads must not stack-build it
+                rows = self._exec(
+                    "SELECT id,collection,text,meta,vec,value,hits FROM items").fetchall()
+                cache = [Hit(r[0], r[1], r[2], json.loads(r[3]), 0.0, r[5]) for r in rows]
+                vecs = (np.stack([_vec(r[4]) for r in rows]) if rows
+                        else np.zeros((0, self.embedder.dim), np.float32))
                 self._cache = cache
                 self._vecs = vecs
-        return self._cache
+            return self._cache
 
     def search(self, query: str,
                collections: tuple[str, ...] = ("docs", "episodes", "prefs", "cards", "reminders"),

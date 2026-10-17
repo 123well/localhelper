@@ -82,6 +82,24 @@ class Agent(ControlMixin):
                               idle_sec=self.bridge.idle_seconds)
             self.study = StudyPipeline(self.cards, queue, gate,
                                        max_segments_per_source=self.cfg.knowledge.max_segments_per_source)
+        # auto-seed: first run with an EMPTY knowledge base must not sit idle —
+        # the agent studies its own project docs (README + docs/) immediately.
+        # User-authorized dirs (cfg.knowledge.auto_study_dirs) are seeded too.
+        self._seeded = False
+        if self.study is not None and self.cfg.knowledge.enabled:
+            try:
+                empty_kb = self.cards.quality_report().get("cards", 0) == 0
+                n = 0
+                if empty_kb:
+                    n += self.study.ingest_dir(str(Path(__file__).resolve().parent.parent),
+                                               project="agent-self", priority=3)
+                for d in self.cfg.knowledge.auto_study_dirs:
+                    n += self.study.ingest_dir(d, project="user-dir", priority=2)
+                if n:
+                    log.info("bootstrap study: %d docs queued", n)
+                    self._seeded = True
+            except Exception:  # noqa: BLE001
+                log.exception("bootstrap study seeding failed (non-fatal)")
         # ---- runtime/control-plane state (spec: daemon + settings-ready API)
         self.channels = Channels(self)
         # initiative engine holds the InitiativeConfig dataclass; give it a
@@ -138,7 +156,8 @@ class Agent(ControlMixin):
             (IdleWatcher(self.bus, self.bridge,
                          self.cfg.initiative.idle_help_after_sec).run(), "idle"),
             (self.bus.run(), "event-bus"),
-            (self.night_scheduler(), "night-scheduler"))]
+            (self.night_scheduler(), "night-scheduler"),
+            (self.startup_study_burst(), "startup-study"))]
         # control socket task (created by the daemon entrypoint) is awaited
         # too — see cli._daemon_main; here we only own our source tasks.
         log.info("kde-agent up; data=%s", self.cfg.data_dir)
@@ -163,6 +182,22 @@ class Agent(ControlMixin):
         block forever on queues/pipes (daemon would never exit)."""
         while self.running:
             await asyncio.sleep(0.5)
+
+    async def startup_study_burst(self) -> None:
+        """Never-idle policy at boot: if bootstrap seeding queued material,
+        process a short bounded batch right away (KB starts filling without
+        waiting for the first idle window). Heavy work stays off the hot path:
+        to_thread + 10s wall-clock budget; energy gate still applies inside."""
+        if not self._seeded or self.study is None:
+            return
+        try:
+            reps = await asyncio.to_thread(self.study.run_pending, 10.0)
+            if reps:
+                cards = sum(r.get("cards", 0) for r in reps)
+                log.info("startup study burst: %d sources, %d cards", len(reps), cards)
+                self.memory.episode("study", f"startup burst: {len(reps)} sources")
+        except Exception:  # noqa: BLE001
+            log.exception("startup study burst failed (non-fatal)")
 
     async def shutdown(self, reason: str = "stop") -> None:
         """Safe graceful stop (spec item 5: SIGTERM/logind events).
@@ -248,6 +283,15 @@ class Agent(ControlMixin):
         ivs = self.initiative.on_idle(ev.payload.get("idle_sec", 0))
         if ivs:
             self.initiative.present(ivs)
+        # never-idle policy: idle is the natural window for background study
+        # (energy gate + budget inside still protect battery/load/user work)
+        if self.study is not None and not getattr(self, "_bg_learning_paused", False):
+            try:
+                done = await asyncio.to_thread(self.study.run_pending, 15.0)
+                if done:
+                    log.info("idle study batch: %d sources", len(done))
+            except Exception:  # noqa: BLE001
+                log.exception("idle study batch failed (non-fatal)")
 
     async def on_cancelled(self, ev) -> None:
         self.initiative.habits.utility.setdefault("idle", -0.2)
@@ -276,11 +320,11 @@ class Agent(ControlMixin):
             self.initiative.habits.penalize_missed(arg or "typo_cmd", {"note": line})
             print("пропущенная ошибка учтена (штраф)")
         elif cmd == "sleep":
-            rep(self.control("sleep", arg))
+            rep(await self.control_async("sleep", arg))
         elif cmd == "study":
             # /study add <файл|dir> -> control("study", "add ..."); иначе аргумент
             # передаётся как есть (число = бюджет секунд, stop/queue).
-            rep(self.control("study", arg))
+            rep(await self.control_async("study", arg))
         elif cmd == "index":
             if self.study is not None:
                 n = self.study.ingest_dir(arg or str(Path.cwd()),

@@ -105,6 +105,7 @@ class KnowledgeConfig:
     study_priority_default: int = 5   # lower = studied first
     sandbox_examples: bool = True     # run doc examples only in sandbox
     mask_secrets: bool = True         # privacy gate before DB writes (never disable in prod)
+    auto_study_dirs: list[str] = field(default_factory=list)  # user-authorized dirs, seeded into queue on startup
 
 
 @dataclass

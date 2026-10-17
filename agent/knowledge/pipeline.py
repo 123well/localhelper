@@ -227,7 +227,8 @@ class StudyPipeline:
 
     def process_one(self, src: Source) -> dict:
         report = {"path": src.path, "segments": 0, "cards": 0, "masked": 0,
-                  "sandbox_checked": 0, "conflicts": 0, "skipped": ""}
+                  "sandbox_checked": 0, "conflicts": 0, "selfchecked": 0,
+                  "selfcheck_failed": 0, "skipped": ""}
         try:
             content = Path(src.path).read_text(errors="replace")
         except OSError as e:
@@ -260,9 +261,72 @@ class StudyPipeline:
             if card.meta.get("conflict_with"):
                 report["conflicts"] += 1
             report["cards"] += 1
-        self.queue.mark(src.path, "done")
+            # --- self-check (spec): a read material is NOT "learned" until
+            # retrieval actually answers questions derived from it. Bad score
+            # => requeue for another pass instead of silently trusting it.
+            ok, score = self.selfcheck_card(card)
+            report["selfchecked"] += 1
+            if not ok:
+                report["selfcheck_failed"] += 1
+                m = dict(card.meta or {})
+                m["needs_restudy"] = True
+                m["selfcheck_score"] = round(score, 3)
+                self.cards.update_meta(card.id, m)
+        status = "done"
+        if report["selfcheck_failed"] * 2 > max(1, report["selfchecked"]):
+            # majority of cards failed verification -> schedule a retry
+            self.queue.enqueue(Source(path=src.path, priority=max(1, src.priority - 1),
+                                      project=src.project))
+            status = "restudy"
+        self.queue.mark(src.path, status)
         self.last_report = report
         return report
+
+    # ------------------------------------------------------------------
+    # Knowledge self-check (deterministic core; swap-in point for the SSM:
+    # with real weights `model.think()` grades the answer instead of lexical
+    # overlap — same contract: returns (passed: bool, score: float)).
+    # ------------------------------------------------------------------
+    STOPWORDS = set("""the a an и в во не он она оно они что как это для если
+    при на с к by of to and in is are this that with""".split())
+
+    def make_questions(self, card) -> list[str]:
+        """Verification questions from the card itself: each search phrase /
+        example line becomes a query the agent must be able to answer by
+        retrieving THIS card."""
+        qs = []
+        for p in (card.phrases or [])[:3]:
+            words = [w for w in re.findall(r"[\wа-яё-]+", p.lower())
+                     if len(w) > 3 and w not in self.STOPWORDS]
+            if len(words) >= 2:
+                qs.append(" ".join(words[:6]))
+        if not qs and card.summary:
+            qs.append(card.summary[:120])
+        return qs[:3]
+
+    def selfcheck_card(self, card, threshold: float = 0.5) -> tuple[bool, float]:
+        """Ask the KB the card's own questions; pass if the card itself comes
+        back top-1 AND shares enough key tokens with the question."""
+        if card.item_id is None:
+            return True, 1.0          # merged duplicate: knowledge is present
+        best = 0.0
+        asked = 0
+        for q in self.make_questions(card):
+            hits = self.cards.mem.search(q, ("cards",), top_k=3)
+            asked += 1
+            if not hits:
+                continue
+            top = hits[0]
+            if top.id == card.item_id:
+                toks_q = {t for t in re.findall(r"[\wа-яё-]+", q.lower())
+                          if len(t) > 3}
+                toks_c = {t for t in re.findall(
+                    r"[\wа-яё-]+", (card.summary + " " + card.body[:400]).lower())
+                    if len(t) > 3}
+                overlap = len(toks_q & toks_c) / max(1, len(toks_q))
+                best = max(best, min(1.0, 0.5 + 0.5 * overlap))
+        score = best if asked else 1.0
+        return score >= threshold, score
 
     def run_pending(self, budget_sec: float = 20.0) -> list[dict]:
         """Respect the energy gate; drain queue within wall-clock budget."""
@@ -276,8 +340,42 @@ class StudyPipeline:
             if src is None:
                 break
             reports.append(self.process_one(src))
+        # housekeeping (spec: consolidation during idle): merge/dedup review,
+        # conflicts report, restudy-flagged cards get requeued occasionally.
+        try:
+            self._housekeeping()
+        except Exception:  # noqa: BLE001  maintenance must never kill the batch
+            log.exception("study housekeeping failed (non-fatal)")
         self.last_report = {"ran": len(reports), "reason": why}
         return reports
+
+    def _housekeeping(self) -> None:
+        """Low-cost consolidation every batch (spec: during idle the agent
+        systematizes knowledge, not only ingests new material):
+          1. decay/prune forgotten episodes & docs (Ebbinghaus curve),
+          2. requeue sources whose cards failed self-check last pass."""
+        # 1. forgetting curve — cheap UPDATE/DELETE, bounded by row count
+        pruned = self.cards.mem.decay_and_prune()
+        if pruned:
+            log.info("housekeeping: pruned %d low-value items", pruned)
+        # 2. restudy retries: one per batch to keep cost bounded
+        for c in self.cards.needs_restudy():
+            src_path = (c.meta or {}).get("source", "")
+            if not src_path or not Path(src_path).exists():
+                continue
+            row = self.queue._exec(
+                "SELECT status, ts FROM study_queue WHERE path=?",
+                (src_path,)).fetchone()
+            if row and row[0] == "restudy":
+                continue                      # already requeued last pass
+            if row and time.time() - (row[1] or 0) < 6 * 3600:
+                continue                      # throttle: retry no sooner than 6h
+            self.queue.enqueue(Source(path=src_path, priority=7,
+                                      project=(c.meta or {}).get("project", "")))
+            m = dict(c.meta or {})
+            m.pop("needs_restudy", None)      # flag consumed; next pass re-checks
+            self.cards.update_meta(c.id, m)
+            break
 
 
 def _guess_lang(path: str) -> str:
