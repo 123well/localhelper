@@ -19,11 +19,13 @@ vector; learning happens on the few active features only.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from agent.core.runtime import OutputMsg
 from agent.core.typo_model import Lexicon, ModelTypoAnalyzer, make_analyzer
 
 
@@ -440,6 +442,21 @@ class InitiativeEngine:
             if self.notifier:
                 self.notifier.notify("KDE Agent", iv.message,
                                      actions=["Принять", "Отклонить"], reply_key=key)
+            else:
+                # no KDE notification channel (headless/daemon without session
+                # bus): initiative must still reach the user — stdout+log via
+                # the agent's output channels, explicitly tagged as initiative.
+                try:
+                    ch = getattr(self.cfg, "_channels", None)
+                    if ch is not None:
+                        ch.emit(OutputMsg("initiative", iv.message,
+                                          meta={"key": key}))
+                    else:
+                        logging.getLogger("kde-agent.initiative").info(
+                            "[initiative] %s", iv.message)
+                except Exception:  # noqa: BLE001  presentation is best-effort
+                    logging.getLogger("kde-agent.initiative").info(
+                        "[initiative] %s", iv.message)
 
     def feedback(self, key: str, reaction: str) -> float:
         iv = self.pending.pop(key, None)
