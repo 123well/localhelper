@@ -45,6 +45,12 @@ class ModelConfig:
 
 @dataclass
 class SafetyConfig:
+    # Operating mode (spec: safe mode / confirm-all / read-only). One of:
+    #   normal      — full autonomy within the risk gates;
+    #   safe        — analysis/retrieval/proposals only, NO execution or writes;
+    #   confirm_all — every action requires explicit user confirmation;
+    #   read_only   — filesystem reads allowed, all mutations blocked.
+    mode: str = "normal"
     blacklist: list[str] = field(default_factory=lambda: [
         "rm -rf /", "rm -rf /*", "mkfs", "dd if=", ":(){", "> /dev/sda",
         "chmod -R 777 /", "userdel", "passwd", "systemctl poweroff",
@@ -65,6 +71,10 @@ class SafetyConfig:
 
 @dataclass
 class InitiativeConfig:
+    enabled: bool = True              # global proactivity switch (spec item 4):
+                                      # false -> daemon keeps serving direct
+                                      # commands/scripts/background study,
+                                      # but ALL interventions are silenced
     base_threshold: float = 0.55      # adaptive intervention threshold
     min_threshold: float = 0.35
     max_threshold: float = 0.9

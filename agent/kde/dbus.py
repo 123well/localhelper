@@ -79,7 +79,6 @@ class KDEBridge:
     def confirm(self, question: str, dangerous: bool = True) -> bool:
         """Blocking yes/no. In headless/tests auto-approves safe ops only."""
         if shutil.which("kdialog") and _has_display():
-            args = ["kdialog", "--title", "KDE Agent", "--icon" if not dangerous else ""]
             cmd = ["kdialog", "--title", "KDE Agent"]
             cmd += ["--warning" if dangerous else "--info"]
             cmd += ["--yesno", question]
@@ -132,15 +131,22 @@ class KDEBridge:
             subprocess.run([launcher, "exec", app], check=False)
 
     def idle_seconds(self) -> float:
-        try:
-            if self.bus:
-                pass  # async path handled by event monitor
-        except Exception:  # noqa: BLE001
-            pass
-        r = subprocess.run(["xprintidle"], capture_output=True, text=True, check=False)
-        if r.returncode == 0 and r.stdout.strip().isdigit():
-            return int(r.stdout.strip()) / 1000.0
-        return 0.0
+        """Best-effort idle seconds. NOTE (explicit prototype/NPU split): the
+        production path is org.freedesktop.ScreenSaver.GetIdleSeconds /
+        KIdleTime over D-Bus (async); this sync fallback uses xprintidle
+        (X11 only) and returns -1 when NO idle source exists, so callers can
+        distinguish 'unknown' from 'active now' (0). Returning 0 previously
+        made IdleWatcher believe the user is always active, so idle-based
+        initiatives could never fire."""
+        if shutil.which("xprintidle"):
+            try:
+                r = subprocess.run(["xprintidle"], capture_output=True, text=True,
+                                   timeout=2, check=False)
+                if r.returncode == 0 and r.stdout.strip().isdigit():
+                    return int(r.stdout.strip()) / 1000.0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return -1.0
 
     # ---------- power (energy gate input; cheap sysfs poll, no D-Bus needed) --
     def on_battery(self) -> bool:

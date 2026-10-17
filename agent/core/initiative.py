@@ -360,6 +360,8 @@ class InitiativeEngine:
 
     # ---- event entry points (called by EventMonitor / loop) -------------
     def on_user_line(self, line: str) -> list[Intervention]:
+        if not getattr(self.cfg, "enabled", True):
+            return []      # proactivity globally switched off (spec item 4)
         out = []
         # 1. model-based typo verdicts FIRST — before the lexicon has seen this
         #    line. Observing first would let a single sighting of 'gti'
@@ -391,6 +393,8 @@ class InitiativeEngine:
         return out
 
     def on_idle(self, idle_sec: float) -> list[Intervention]:
+        if not getattr(self.cfg, "enabled", True):
+            return []
         if idle_sec >= self.cfg.idle_help_after_sec:
             iv = Intervention("idle", "Похоже, вы застряли — нужна помощь?", 0.5,
                               {"idle_sec": idle_sec})
@@ -421,7 +425,13 @@ class InitiativeEngine:
         return []
 
     # ---- presentation & feedback ----------------------------------------
+    def set_enabled(self, enabled: bool) -> None:
+        """Global proactivity switch (daemon control; future settings UI)."""
+        self.cfg.enabled = bool(enabled)
+
     def present(self, ivs: list[Intervention]) -> None:
+        if not getattr(self.cfg, "enabled", True):
+            return           # hard mute: nothing reaches the user when off
         for iv in ivs:
             key = iv.type + ":" + str(iv.ts)
             self.pending[key] = iv

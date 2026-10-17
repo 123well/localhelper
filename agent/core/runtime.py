@@ -1,0 +1,267 @@
+"""Agent runtime core: state, control commands, lifecycle.
+
+Channel-agnostic by design (spec): every input source (terminal stdin, shell
+hook socket, D-Bus event, future voice input / GUI chat / hotkeys) funnels
+into `handle_input(text, channel)`; every output goes through one of the
+`OutputChannel`s (stdout text, notification, log; future TTS/GUI chat). The
+kernel never knows which physical UI is attached — that is exactly the seam
+where the C++ settings window plugs in later without touching this module.
+
+Control plane (used now by CLI slash-commands & `kde-agent ctl`, later by the
+settings UI / D-Bus service): a flat command dispatch `Agent.control(name, arg)`
+returning a plain dict — JSON-friendly, testable, UI-ready.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass
+class OutputMsg:
+    kind: str          # answer | initiative | notify | error | status
+    text: str
+    channel_hint: str = "auto"   # auto -> cfg.output_channels
+    meta: dict = field(default_factory=dict)
+
+
+class Channels:
+    """Output channels registry. Prototype wires stdout+log; KDE notifications
+    are added when the bridge connects; voice/GUI are declared but inactive."""
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.registry: dict[str, Callable[[OutputMsg], None]] = {}
+        self.declare("stdout", self._stdout)
+        self.declare("log", self._log)
+        self.declare("notification", self._notify)      # active once bridge up
+        self.declare("voice_out", self._inactive)       # future TTS
+        self.declare("gui_chat", self._inactive)        # future plasmoid/chat
+
+    def declare(self, name: str, fn: Callable[[OutputMsg], None]) -> None:
+        self.registry[name] = fn
+
+    def _inactive(self, msg: OutputMsg) -> None:
+        logging.getLogger("kde-agent.channel").debug(
+            "channel %s not wired yet (planned): %s", msg.kind, msg.text[:80])
+
+    def _stdout(self, msg: OutputMsg) -> None:
+        prefix = {"initiative": "AGENT[инициатива]> ", "error": "AGENT[ошибка]> ",
+                  "status": "", "notify": "AGENT> ", "answer": "AGENT> "}.get(msg.kind, "AGENT> ")
+        print(f"\n{prefix}{msg.text}\n")
+
+    def _log(self, msg: OutputMsg) -> None:
+        logging.getLogger("kde-agent.out").info("[%s] %s", msg.kind, msg.text[:400])
+
+    def _notify(self, msg: OutputMsg) -> None:
+        b = getattr(self.agent, "bridge", None)
+        if b and b.available:
+            b.notify("KDE Agent", msg.text, urgency="normal" if msg.kind != "initiative" else "low")
+        else:
+            self._log(msg)
+
+    def emit(self, msg: OutputMsg) -> None:
+        allowed = self.agent.cfg.output_channels or ["stdout", "log"]
+        for ch in allowed:
+            fn = self.registry.get(ch)
+            if fn:
+                try:
+                    fn(msg)
+                except Exception:  # noqa: BLE001  a broken channel must not kill the loop
+                    logging.getLogger("kde-agent.channel").exception("channel %s failed", ch)
+
+
+# ---------------------------------------------------------------------------
+CONTROL_HELP = {
+    "status":            "состояние ядра, режим, каналы, очередь событий",
+    "doctor":            "полная диагностика подсистем (отчёт ok/warn/fail)",
+    "mode <нормальный|safe|confirm_all|read_only>": "режим работы безопасности",
+    "proactivity on|off": "глобальное включение/выключение инициативы (демон продолжает обслуживать команды)",
+    "sleep":             "принудительный цикл сна (обучение адаптеров + гейты)",
+    "sleep stop":        "остановить сон/фоновое обучение немедленно",
+    "sleep last":        "отчёт последнего сна",
+    "study [бюджет_сек]": "принудительный прогон очереди фонового изучения",
+    "study add <dir>":   "поставить директорию/файл в очередь изучения",
+    "kb stats":          "статус базы знаний (карточки, конфликты, устаревшие)",
+    "kb list":           "последние карточки знаний",
+    "kb search <запрос>":"поиск по карточкам",
+    "kb conflicts":      "список открытых конфликтов",
+    "kb resolve <keep_id> <drop_id>": "разрешить конфликт вручную",
+    "kb remove <id>":    "удалить карточку (устаревшее знание)",
+    "kb reindex":        "принудительная переиндексация векторов памяти",
+    "kb clear <docs|cards|episodes|prefs|all>": "очистка коллекции (требует подтверждения)",
+    "logs [N]":          "последние N строк лога",
+    "history [N]":       "последние действия агента (эпизоды)",
+    "config [путь]":     "показать конфигурацию (без секретов)",
+    "tasks":             "активные фоновые задачи (idle-гейт, планировщик)",
+}
+
+
+class ControlMixin:
+    """Implements the control plane on top of Agent state. Mixed into Agent."""
+
+    # ---- output helpers ---------------------------------------------------
+    def say(self, text: str, kind: str = "answer") -> None:
+        self.channels.emit(OutputMsg(kind, text))
+
+    # ---- unified input funnel (channel-agnostic kernel entry) -------------
+    async def handle_input(self, text: str, channel: str = "terminal") -> None:
+        """Single entry point for ALL input sources: terminal line, shell hook,
+        D-Bus event, future voice-in / GUI chat / hotkey. Slash/ctl commands
+        bypass the model; natural language goes to the ReAct loop."""
+        text = text.strip()
+        if not text:
+            return
+        self.ctx.add("user", f"[{channel}] {text}", score=2.0)
+        if text.startswith("/"):
+            await self.slash(text)
+            return
+        await self.think_loop(user_msg=text)
+
+    # ---- control plane ----------------------------------------------------
+    def control(self, name: str, arg: str = "") -> dict:
+        """Programmatic management API (CLI `ctl`, D-Bus, future settings UI)."""
+        name = name.lower().strip()
+        try:
+            if name == "status":
+                return self._ctl_status()
+            if name == "doctor":
+                from agent.core.diagnostics import run_doctor
+                return {"report": run_doctor(self)}
+            if name == "mode":
+                err = self.safety.set_mode(arg.strip())
+                if err:
+                    return {"ok": False, "error": err.reason}
+                self.cfg.save()
+                return {"ok": True, "mode": self.safety.mode}
+            if name == "proactivity":
+                on = arg.strip().lower() in ("on", "1", "true", "вкл")
+                self.initiative.set_enabled(on)
+                self.cfg.initiative.enabled = on
+                self.cfg.save()
+                return {"ok": True, "proactivity": on}
+            if name == "sleep":
+                if arg.strip() == "stop":
+                    self._sleep_stop_event.set()
+                    self._bg_learning_paused = True
+                    return {"ok": True, "sleep": "stopped/paused"}
+                if arg.strip() == "last":
+                    p = self.cfg.data_dir / "last_sleep.json"
+                    return json.loads(p.read_text()) if p.exists() else {"skipped": "нет данных"}
+                rep = self.trainer.sleep_cycle()
+                (self.cfg.data_dir / "last_sleep.json").write_text(json.dumps(rep, ensure_ascii=False))
+                if "saved" in rep:
+                    self.model.load_adapter(str(self.trainer.active_path))
+                return {"ok": True, "report": rep}
+            if name == "study":
+                if self.study is None:
+                    return {"ok": False, "error": "knowledge subsystem disabled"}
+                if arg.strip().startswith("add"):
+                    path = arg.split(maxsplit=1)[1] if " " in arg else ""
+                    n = self.study.ingest_dir(path or str(self.cfg.data_dir))
+                    return {"ok": True, "queued": n}
+                self._bg_learning_paused = False
+                reps = self.study.run_pending(budget_sec=float(arg or 20))
+                return {"ok": True, "processed": len(reps), "queue": self.study.queue.stats()}
+            if name == "kb":
+                return self._ctl_kb(arg)
+            if name == "logs":
+                n = int(arg or 30)
+                lines = self.cfg.log_path.read_text(errors="replace").splitlines()[-n:] \
+                    if self.cfg.log_path.exists() else []
+                return {"ok": True, "log": "\\n".join(lines)[-4000:]}
+            if name == "history":
+                eps = self.memory.recent_episodes(int(arg or 15))
+                return {"ok": True, "episodes": [{"kind": e.meta.get("kind", ""),
+                                                   "text": e.text[:160], "ts": round(e.value, 2)} for e in eps]}
+            if name == "config":
+                d = json.loads(self.cfg.to_json())
+                return {"ok": True, "config": d}
+            if name == "tasks":
+                return {"ok": True, "running": self.running,
+                        "learning_paused": getattr(self, "_bg_learning_paused", False),
+                        "pending_interventions": len(self.initiative.pending),
+                        "study_queue": self.study.queue.stats() if self.study else {}}
+            if name == "help":
+                return {"ok": True, "commands": CONTROL_HELP}
+            return {"ok": False, "error": f"неизвестная команда '{name}'", "commands": list(CONTROL_HELP)}
+        except Exception as e:  # noqa: BLE001  control plane must never crash the daemon
+            logging.getLogger("kde-agent.ctl").exception("control %s failed", name)
+            return {"ok": False, "error": str(e)}
+
+    # ---- sub-handlers -----------------------------------------------------
+    def _ctl_status(self) -> dict:
+        return {"ok": True, "running": self.running,
+                "mode": self.safety.mode,
+                "proactivity": bool(getattr(self.cfg.initiative, "enabled", True)),
+                "backend": type(self.model.backend).__name__,
+                "adapter": self.model.adapter_version,
+                "ctx_tokens": self.ctx.total(),
+                "pending_interventions": list(self.initiative.pending)[:5],
+                "channels": self.cfg.output_channels,
+                "kb": self.cards.quality_report() if self.cards else "disabled",
+                "sleep_last": (self.cfg.data_dir / "last_sleep.json").exists()}
+
+    def _ctl_kb(self, arg: str) -> dict:
+        if self.cards is None:
+            return {"ok": False, "error": "knowledge subsystem disabled (knowledge.enabled=false)"}
+        parts = arg.split()
+        op = parts[0] if parts else "stats"
+        if op == "stats":
+            return {"ok": True, **self.cards.quality_report(),
+                    "queue": self.study.queue.stats() if self.study else {}}
+        if op == "list":
+            return {"ok": True, "cards": [{"id": c.id, "v": c.version, "type": c.type,
+                                            "summary": c.summary[:80], "value": round(c.value, 2),
+                                            "usages": c.usages} for c in self.cards.list_cards(limit=25)]}
+        if op == "search" and len(parts) > 1:
+            q = arg.split(maxsplit=1)[1]
+            found = self.cards.search(q, top_k=5)
+            return {"ok": True, "hits": [{"id": c.id, "type": c.type, "summary": c.summary[:90]} for c in found]}
+        if op == "conflicts":
+            return {"ok": True, "conflicts": [{"card": c.id, "summary": c.summary[:70], "vs": other}
+                                               for c, other in self.cards.pending_conflicts()]}
+        if op == "resolve" and len(parts) == 3:
+            self.cards.resolve_conflict(int(parts[1]), int(parts[2]))
+            return {"ok": True, "resolved": f"kept #{parts[1]}"}
+        if op == "remove" and len(parts) == 2:
+            self.cards.remove(int(parts[1]))
+            return {"ok": True, "removed": parts[1]}
+        if op == "reindex":
+            return self._kb_reindex()
+        if op == "clear" and len(parts) >= 2:
+            coll = parts[1]
+            ok = self.bridge.confirm(f"Удалить коллекцию базы знаний '{coll}'? Это необратимо.", dangerous=True)
+            if not ok:
+                return {"ok": False, "error": "отменено пользователем"}
+            return self._kb_clear(coll)
+        return {"ok": False, "error": "kb stats|list|search <q>|conflicts|resolve <keep> <drop>|remove <id>|reindex|clear <coll>"}
+
+    def _kb_reindex(self) -> dict:
+        """Recompute vectors for every item with the current frozen encoder
+        (needed after swapping the embedder implementation)."""
+        rows = self.memory.db.execute("SELECT id,text FROM items").fetchall()
+        for rid, text in rows:
+            vec = self.memory.embedder.embed(text)
+            self.memory.db.execute("UPDATE items SET vec=? WHERE id=?",
+                                   (vec.astype("float32").tobytes(), rid))
+        self.memory.db.commit()
+        self.memory._cache = None
+        return {"ok": True, "reindexed": len(rows)}
+
+    def _kb_clear(self, coll: str) -> dict:
+        if coll == "all":
+            q = "DELETE FROM items"; n = "items"
+            self.memory.db.execute("DELETE FROM cards"); self.memory.db.execute("DELETE FROM card_conflicts")
+        else:
+            q = "DELETE FROM items WHERE collection=?"; n = coll
+            if coll == "cards":
+                self.memory.db.execute("DELETE FROM cards")
+        cur = self.memory.db.execute(q, () if coll == "all" else (coll,))
+        self.memory.db.commit()
+        self.memory._cache = None
+        return {"ok": True, "deleted": cur.rowcount, "collection": n}
