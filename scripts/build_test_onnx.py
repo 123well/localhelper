@@ -36,68 +36,94 @@ from pathlib import Path
 import numpy as np
 
 
+# Scripted answers emitted by the tiny test graph (agent JSON contract).
+# Keyed by the LAST character of the prompt (the backend streams prompt
+# tokens without attention, so only the final token selects the row).
+# Keys are chosen so every demo/test intent routes correctly:
+#   "v" <- "...files in ~/dev" / "ls -la"        -> list_files
+#   "/" <- "выполни rm -rf /"                    -> confirm_dialog (risk gate)
+#   ")" <- "открой файл config.py)"              -> read_file
+#   "?" <- typo-analysis prompts ending "ASSISTANT:"-> {"is_typo":true,...}
+#   "." <- everything else (direct questions)    -> plain reply
+PATTERNS = {
+    "v": ('{"thought":"user wants a directory listing","actions":'
+          '[{"tool":"list_files","args":{"path":"~/dev"}}],"reply":""}'),
+    "/": ('{"thought":"rm -rf is destructive; ask first","actions":'
+          '[{"tool":"confirm_dialog","args":{"question":"Delete '
+          'everything? Needs user confirmation."}}],"reply":""}'),
+    ")": ('{"thought":"file read","actions":[{"tool":"read_file",'
+          '"args":{"path":"config.py"}}],"reply":""}'),
+    "?": ('{"is_typo":true,"confidence":0.8,'
+          '"intended":"git","reason":"cmd not in evidence"}'),
+    ".": ('{"thought":"no tool needed","actions":[],'
+          '"reply":"ok from tiny ssm"}'),
+}
+
+
+def _ascii_only(s):
+    return "".join(c for c in s if 32 <= ord(c) < 127)
+
+
+def required_d() -> int:
+    """Minimum d_model for the policy matrix: one channel per scripted char
+    plus a small guard band (see _policy_matrix)."""
+    return max(len(_ascii_only(t)) for t in PATTERNS.values()) + 8
+
+
 def _policy_matrix(vocab: int, d: int):
     """Deterministic emit-policy rows for the tiny graph's C_out.
 
-    Row j of C_out scores logits over the vocabulary; argmax picks the next
-    token. Default rows produce a benign filler word then EOS (so unknown
-    contexts terminate cleanly). Pattern rows override specific last-prefill-
-    token ids to emit the agent JSON-contract answers.
-    Returns (C_out, {last_char: (pattern_str, start_idx)} for diagnostics).
+    Row `tok` of C_out scores the logits of the NEXT token as a function of
+    the hidden-state channels; argmax picks what gets emitted.  The backend
+    feeds prompt tokens one-by-one WITHOUT attention, so the recurrent state
+    at the first decode step is dominated by the LAST prefill token — hence
+    patterns key on that token's char id.
+
+    Design (regression history in comments below):
+      * channel-0 spikes -> one column won at EVERY step ("AAAA...");
+      * one-hot rows keyed on the streaming position -> the mixed recurrent
+        hidden (tanh of dense matmuls, L1 ~ 40 after saturation) drowned the
+        script ("HNHN...", "/>v)").
+    Working design: SCALE SEPARATION that survives arbitrary bounded mixing.
+      * A pattern's text lives in the LOW channels of its own row, one char
+        per channel (values ord(ch) >= 32).  The freshest state channel
+        dominates the mixed older ones, so early decode steps walk the
+        scripted string left-to-right; later steps fall into the zero
+        "dead-zone" channels and drift to other rows — harmless because the
+        consumer parses the FIRST complete JSON object and stops.
+      * Unknown rows emit a benign "ok" filler then EOS via the high channel
+        d-1, so garbage contexts always terminate cleanly.
+    Real graphs replace this whole matrix with trained heads.  What tests
+    guarantee is the CONTRACT: loadable graph, [1,V] logits, state streaming,
+    eos termination, valid agent JSON out of OnnxSsmBackend.generate().
+    Returns (C_out, {last_char: (pattern_str, row_id)} for diagnostics).
     """
-    # Rows are ONE-HOT on the *streaming position* k, not on channel 0.
-    # The backend feeds prompt tokens one-by-one WITHOUT attention and picks
-    # the next token as argmax(hid @ C_out).  hid mixes every channel, so a
-    # channel-0 spike made the same column win at every step regardless of
-    # context (the old 'AAAA...' failure).  With C_out[k, tok] = 1 the graph
-    # emits text[k] at decode step k: logits = one_hot(pos) @ C_out, exactly
-    # the deterministic scripted-policy contract.  Real graphs replace this
-    # whole matrix with trained heads.
-    filler = "ok"
     EOS_ID = 95   # </s> id (see build_tokenizer); asserted there too
 
-    def _ascii_only(s):
-        return "".join(c for c in s if 32 <= ord(c) < 127)
+    need = required_d()
+    if d < need:
+        raise SystemExit(f"--d must be >= {need} to hold the scripted patterns "
+                         f"(got {d}); rerun scripts/build_test_onnx.py --d {need}")
 
     C = np.zeros((d, vocab), dtype=np.float32)
 
-    def set_row(row_id, seq):
-        """Scripted output emitted when the last prefill token has id `row_id`.
+    # generic default rows: emit "ok" then EOS via the high channel
+    filler = "ok"
+    for r in range(1, vocab):
+        if r == EOS_ID or chr(r) in PATTERNS:
+            continue
+        for k, ch in enumerate(filler):
+            C[k, r] = float(ord(ch))
+    C[d - 1, EOS_ID] = float(EOS_ID)
 
-        Channels 0..len-1 carry one-hot ids of text[k]; channel `eos_ch` is a
-        dedicated stop-marker whose only winning vocabulary column is EOS_ID,
-        so after the script ends the graph emits </s> and generation halts.
-        """
-        seq = _ascii_only(seq)
-        eos_ch = d - 1
-        if len(seq) + 1 > eos_ch:
-            print(f"WARN: pattern for id {row_id} ({len(seq)} chars) truncated "
-                  f"at d={d}; raise --d to emit it fully")
-            seq = seq[:eos_ch]
-        col = C[:, row_id]
-        col[:] = 0.0
-        for k, ch in enumerate(seq):
-            col[k] = float(ord(ch))          # decode step k -> token ord(ch)
-        col[eos_ch] = float(EOS_ID)          # stop step -> </s>
-
-    for r in range(vocab):
-        set_row(r, filler)
-    # (last prefill char, full emitted text) — text starts at index 0 of C rows
-    patterns = {
-        # keyed by the LAST prefill token (see NOTE in module docstring)
-        "v": ('{"thought":"user wants a directory listing","actions":'
-              '[{"tool":"list_files","args":{"path":"~/dev"}}],"reply":""}'),
-        "/": ('{"thought":"rm -rf is destructive; ask first","actions":'
-              '[{"tool":"confirm_dialog","args":{"question":"Delete '
-              'everything? Needs user confirmation."}}],"reply":""}'),
-        ")": ('{"thought":"file read","actions":[{"tool":"read_file",'
-              '"args":{"path":"config.py"}}],"reply":""}'),
-    }
     diag = {}
-    for last_ch, text in patterns.items():
+    for last_ch, text in PATTERNS.items():
         text = _ascii_only(text)
         row = ord(last_ch)
-        set_row(row, text)
+        col = C[:, row]
+        col[:] = 0.0
+        for k, ch in enumerate(text):
+            col[k] = float(ord(ch))              # channel k -> char of script
         diag[last_ch] = (text, row)
     return C, diag
 
@@ -268,9 +294,18 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--vocab", type=int, default=800)
-    p.add_argument("--d", type=int, default=64)
+    p.add_argument("--d", type=int, default=128,
+                   help="d_model; must fit the longest scripted pattern "
+                        f"(min {required_d()})")
     p.add_argument("--layers", type=int, default=2)
     a = p.parse_args(argv)
+    if a.d < required_d():
+        # auto-grow instead of failing: the state width is meaningless in the
+        # test graph, and every consumer (doctor, tests, demo) builds with the
+        # default — silently too-small d used to produce garbage logits.
+        print(f"note: --d {a.d} too small for the scripted patterns; "
+              f"growing to {required_d()}")
+        a.d = required_d()
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mp = build_graph(out_dir, a.vocab, a.d, a.layers)

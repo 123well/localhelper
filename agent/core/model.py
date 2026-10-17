@@ -180,13 +180,46 @@ class SSMModel:
         return parse_model_output(raw)
 
 
+def parse_first_json(raw: str) -> dict | None:
+    """Parse the FIRST balanced JSON object in `raw` (string/escape aware).
+
+    The old greedy r"\\{.*\\}" grabbed from the first '{' to the LAST '}' —
+    once a model emits any trailing noise after its answer, that slice is
+    invalid JSON and the whole turn silently degrades to ok=False.  Both
+    consumers of backend output (ReAct think() and LLMModelAnalyzer) must
+    tolerate post-object noise, so they share this scanner.
+    """
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    d = json.loads(raw[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+                return d if isinstance(d, dict) else None
+    return None
+
+
 def parse_model_output(raw: str) -> ModelResult:
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        return ModelResult(reply=raw.strip(), ok=False)
-    try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    d = parse_first_json(raw)
+    if d is None:
         return ModelResult(reply=raw.strip(), ok=False)
     acts = [a for a in d.get("actions", []) if isinstance(a, dict) and a.get("tool")]
     return ModelResult(thought=d.get("thought", ""), actions=acts,
