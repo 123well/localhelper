@@ -237,9 +237,11 @@ class StudyPipeline:
             if sandbox_err:
                 meta["example_status"] = f"sandbox_fail: {sandbox_err}"
             existing_conflict = None
+            # CardStore.add() calls the parameter `phrases` — passing
+            # `search_phrases=` crashed every study batch (TypeError).
             card = self.cards.add(type=_guess_type(seg, src), summary=seg.title,
                                   body=masked, examples=examples,
-                                  search_phrases=seg.search_phrases(), meta=meta)
+                                  phrases=seg.search_phrases(), meta=meta)
             if card.meta.get("conflict_with"):
                 report["conflicts"] += 1
             report["cards"] += 1
